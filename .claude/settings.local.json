@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python generate_metric_qas.py:*)",
+      "Bash(python generate_spatial_qas.py:*)",
+      "Bash(python test_qas.py:*)"
+    ]
+  }
+}

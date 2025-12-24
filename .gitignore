@@ -1,2 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Outputs
+outputs/
+*.mp4
+*.avi
+
+# Houses (from master)
 houses
-__pycache__
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# Claude
+CLAUDE.md
+.claude/settings.local.json
+generate_test_episode.py

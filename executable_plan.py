@@ -114,6 +114,32 @@ def _visible_object_ids(event):
     return [obj.get("objectId") for obj in objects if obj.get("visible")]
 
 
+def _extract_visible_objects_details(event):
+    """Extract detailed information about visible objects including positions and bounding boxes."""
+    metadata = getattr(event, "metadata", {})
+    objects = (metadata or {}).get("objects", [])
+
+    # Get list of visible object IDs
+    visible_ids_set = set(_visible_object_ids(event))
+
+    # Extract details for visible objects
+    objects_details = []
+    for obj in objects:
+        obj_id = obj.get("objectId")
+        if obj_id and obj_id in visible_ids_set:
+            detail = {
+                "objectId": obj_id,
+                "objectType": obj.get("objectType"),
+                "position": obj.get("position"),  # {x, y, z}
+                "rotation": obj.get("rotation"),  # {x, y, z}
+                "axisAlignedBoundingBox": obj.get("axisAlignedBoundingBox"),  # {center, size}
+                "distance": obj.get("distance"),  # distance from camera
+            }
+            objects_details.append(detail)
+
+    return objects_details
+
+
 def closest_node(node, nodes, no_robot, clost_node_location):
     crps = []
     distances = distance.cdist([node], nodes)[0]
@@ -454,11 +480,20 @@ def exec_actions():
                 frame_root = agent_dirs[i] / frame_basename
                 cv2.imwrite(str(frame_root.with_suffix(".png")), e.cv2img)
                 visible_ids = _visible_object_ids(e)
+                visible_objects_details = _extract_visible_objects_details(e)
+
+                # Extract camera position and rotation
+                camera_position = e.metadata.get("cameraPosition", {})
+                camera_rotation = e.metadata.get("cameraRotation", {})
+
                 metadata = {
                     "agent_id": i,
                     "agent_name": robots[i]["name"],
                     "frame_index": img_counter,
                     "itemlist": visible_ids,
+                    "visible_objects": visible_objects_details,
+                    "camera_position": camera_position,
+                    "camera_rotation": camera_rotation,
                     "house_id": _SCENE_ID,
                     "nav_target": _RANDOM_NAV_TARGET,
                 }
