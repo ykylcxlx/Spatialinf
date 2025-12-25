@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
+import os
 import random
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -14,7 +16,7 @@ from PIL import Image
 from ai2thor.controller import Controller
 
 # python procthordata/generate_camera_qas.py \
-#   procthordata/houses/train_000.json \
+#   procthordata/houses/train \
 #   --output-dir outputs/cam_motion/images \
 #   --qa-root outputs/cam_motion \
 #   --num-samples 3 \
@@ -60,18 +62,46 @@ DIST_TEMPLATES: Sequence[str] = (
 ROT_DIR_TEMPLATES: Sequence[str] = (
     "[Cam Rotation Dir.] From image 1 to 2, what is the correct camera rotation?",
     "Describe how the camera must rotate to change from the first frame to the second frame.",
-    "Which rotation steps connect image 1 with image 2?",
-    "How did the camera turn (yaw/pitch) when it moved from shot one to shot two?",
+    "When comparing these two shots, which rotation links the first to the second camera pose?",
+    "How must the camera rotate to align the perspective of image 1 with that of image 2?",
 )
 
 DEG_TEMPLATES: Sequence[str] = (
-    "[Cam Rotation Deg.] What is the total vertical rotation angle from one shot to another?",
-    "State the overall pitch change between image 1 and image 2.",
-    "How large is the up/down rotation required to align the first view with the second?",
-    "Give the vertical rotation angle that separates the two camera poses.",
+    "[Cam Rotation Deg.] What is the magnitude of the vertical rotation between the two images?",
+    "Report the absolute value of the pitch change that transforms image 1 into image 2.",
+    "How many degrees separate the vertical orientations of the two camera poses?",
+    "Give the degree value for the up/down rotation when moving from image 1 to image 2.",
 )
 
-CATEGORY_TEMPLATES = {
+PROMPT_PREFIX = "<image>Image 1.<image>Image 2."
+
+CHOICE_LETTERS: Tuple[str, ...] = ("A", "B", "C", "D")
+
+DIRECTION_OPTION_POOL: Tuple[str, ...] = (
+    "Front",
+    "Back",
+    "Left",
+    "Right",
+    "Front-Left",
+    "Front-Right",
+    "Back-Left",
+    "Back-Right",
+    "Same Position",
+)
+
+ROTATION_OPTION_POOL: Tuple[str, ...] = (
+    "Rotate to left",
+    "Rotate to right",
+    "Look up",
+    "Look down",
+    "Rotate to left, look up",
+    "Rotate to left, look down",
+    "Rotate to right, look up",
+    "Rotate to right, look down",
+    "No rotation change.",
+)
+
+CATEGORY_TEMPLATES: Dict[str, Sequence[str]] = {
     "Dir": DIR_TEMPLATES,
     "Dist": DIST_TEMPLATES,
     "RotDir": ROT_DIR_TEMPLATES,
@@ -79,9 +109,157 @@ CATEGORY_TEMPLATES = {
 }
 
 
+def collect_house_paths(path: Path) -> List[Path]:
+    if path.is_dir():
+        candidates = sorted(p for p in path.glob("*.json") if p.is_file())
+        if not candidates:
+            raise FileNotFoundError(f"No JSON files found in directory: {path}")
+        return candidates
+    if path.is_file() and path.suffix.lower() == ".json":
+        return [path]
+    raise FileNotFoundError(f"Expected a JSON file or directory, got: {path}")
+
+
+def write_combined_entries(entries: Sequence[dict], target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def direction_option_text(label: str) -> str:
+    if label == "Same Position":
+        return "Stay at the same position"
+    parts = label.split("-")
+    if len(parts) == 2:
+        return f"Move {parts[0]} then {parts[1]}"
+    return f"Move {label}"
+
+
+def format_distance_mm(value: int) -> str:
+    return f"{value} mm"
+
+
+def format_degrees(value: float) -> str:
+    if math.isclose(value, 0.0, abs_tol=1e-6):
+        return "0 degrees"
+    if float(value).is_integer():
+        return f"{int(value)} degrees"
+    return f"{value:.2f} degrees"
+
+
+def build_choice_options(
+    correct_text: str,
+    distractor_texts: Sequence[str],
+    rng: random.Random,
+) -> Tuple[List[Tuple[str, str]], str]:
+    unique_distractors: List[str] = []
+    seen = {correct_text.lower()}
+    for text in distractor_texts:
+        candidate = text.strip()
+        if not candidate:
+            continue
+        lowered = candidate.lower()
+        if lowered in seen:
+            continue
+        unique_distractors.append(candidate)
+        seen.add(lowered)
+        if len(unique_distractors) >= len(CHOICE_LETTERS) - 1:
+            break
+
+    while len(unique_distractors) < len(CHOICE_LETTERS) - 1:
+        filler = f"Option {len(unique_distractors) + 1}"
+        if filler.lower() in seen:
+            filler = f"Choice {len(unique_distractors) + 1}"
+        unique_distractors.append(filler)
+        seen.add(filler.lower())
+
+    options = [correct_text] + unique_distractors[: len(CHOICE_LETTERS) - 1]
+    rng.shuffle(options)
+
+    labeled: List[Tuple[str, str]] = []
+    correct_label = ""
+    for letter, text in zip(CHOICE_LETTERS, options):
+        labeled.append((letter, text))
+        if text.lower() == correct_text.lower():
+            correct_label = letter
+
+    if not correct_label and labeled:
+        labeled[0] = (CHOICE_LETTERS[0], correct_text)
+        correct_label = CHOICE_LETTERS[0]
+
+    return labeled, correct_label
+
+
+def build_direction_options(correct_label: str, rng: random.Random) -> Tuple[List[Tuple[str, str]], str]:
+    pool = list(DIRECTION_OPTION_POOL)
+    if correct_label not in pool:
+        pool.append(correct_label)
+    correct_text = direction_option_text(correct_label)
+    distractors = [direction_option_text(entry) for entry in pool if entry != correct_label]
+    rng.shuffle(distractors)
+    return build_choice_options(correct_text, distractors, rng)
+
+
+def build_distance_options(correct_mm: int, rng: random.Random) -> Tuple[List[Tuple[str, str]], str]:
+    offsets = [-250, -180, -120, -60, 60, 120, 180, 250, 320, 420]
+    candidates: List[int] = []
+    for offset in offsets:
+        candidate = max(1, correct_mm + offset)
+        if candidate != correct_mm:
+            candidates.append(candidate)
+    while len(candidates) < len(CHOICE_LETTERS) - 1:
+        scale = rng.uniform(0.6, 1.6)
+        candidate = max(1, int(round(correct_mm * scale)))
+        if candidate != correct_mm:
+            candidates.append(candidate)
+    distractors = [format_distance_mm(value) for value in candidates]
+    return build_choice_options(format_distance_mm(correct_mm), distractors, rng)
+
+
+def build_rotation_options(correct_label: str, rng: random.Random) -> Tuple[List[Tuple[str, str]], str]:
+    pool = list(ROTATION_OPTION_POOL)
+    if correct_label not in pool:
+        pool.append(correct_label)
+    distractors = [entry for entry in pool if entry != correct_label]
+    rng.shuffle(distractors)
+    return build_choice_options(correct_label, distractors, rng)
+
+
+def build_degree_options(correct_value: float, rng: random.Random) -> Tuple[List[Tuple[str, str]], str]:
+    base = abs(correct_value)
+    deltas = [3.0, 5.0, 8.0, 10.0, 12.0, 15.0]
+    candidates: List[float] = []
+    for delta in deltas:
+        plus = base + delta
+        minus = base - delta
+        candidates.append(max(0.5, plus))
+        if minus > 0.5:
+            candidates.append(minus)
+    while len(candidates) < len(CHOICE_LETTERS) - 1:
+        candidate = max(0.5, base * rng.uniform(0.5, 1.6))
+        if not math.isclose(candidate, base, rel_tol=1e-3, abs_tol=0.1):
+            candidates.append(candidate)
+    distractors = [format_degrees(value) for value in candidates]
+    return build_choice_options(format_degrees(base), distractors, rng)
+
+
+def format_options_text(options: Sequence[Tuple[str, str]]) -> str:
+    return " ".join(f"({label}) {text}" for label, text in options)
+
+
+def get_answer_text(options: Sequence[Tuple[str, str]], label: str) -> str:
+    for option_label, text in options:
+        if option_label == label:
+            return text
+    raise ValueError(f"Missing answer label {label} in options: {options}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("house_json", type=Path, help="Path to a ProcTHOR house JSON file.")
+    parser.add_argument(
+        "house_json",
+        type=Path,
+        help="Path to a ProcTHOR house JSON file or a directory containing multiple JSON files.",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -103,7 +281,7 @@ def parse_args() -> argparse.Namespace:
         "--num-samples",
         type=int,
         default=5,
-        help="Number of QA pairs to generate.",
+        help="Number of QA sample sets to generate per house.",
     )
     parser.add_argument(
         "--seed",
@@ -139,10 +317,9 @@ def parse_args() -> argparse.Namespace:
         "--sequences",
         type=Path,
         help=(
-            "Optional JSON file listing custom action sequences. Supply an array of"
-            " sequences, each sequence being a list of actions. An action can be a"
-            " string (e.g. 'MoveAhead') or an object like {\"action\": \"RotateRight\","
-            " \"params\": {\"degrees\": 30}}."
+            "Optional JSON file listing custom action sequences. Supply an array of sequences, each sequence "
+            "being a list of actions. An action can be a string (e.g. 'MoveAhead') or an object like {\"action\": "
+            "\"RotateRight\", \"params\": {\"degrees\": 30}}."
         ),
     )
     parser.add_argument(
@@ -151,6 +328,275 @@ def parse_args() -> argparse.Namespace:
         help="Optional X display string (e.g., ':1') for headless setups.",
     )
     return parser.parse_args()
+
+
+def create_choice_entry(
+    sample_tag: str,
+    question_type: str,
+    question_text: str,
+    options: Sequence[Tuple[str, str]],
+    correct_label: str,
+    images: Sequence[str],
+    metadata: Dict[str, Any],
+) -> dict:
+    options_text = format_options_text(options)
+    answer_text = get_answer_text(options, correct_label)
+    return {
+        "id": f"{sample_tag}_{question_type.lower()}",
+        "question_type": question_type,
+        "images": list(images),
+        "metadata": copy.deepcopy(metadata),
+        "messages": [
+            {
+                "role": "user",
+                "content": f"{PROMPT_PREFIX} {question_text} {options_text}",
+            },
+            {
+                "role": "assistant",
+                "content": f"({correct_label}) {answer_text}",
+            },
+        ],
+    }
+def generate_samples_for_house(
+    house_path: Path,
+    args: argparse.Namespace,
+    sequences: Optional[Sequence[Tuple[ActionSpec, ...]]],
+    rng: random.Random,
+    start_index: int,
+) -> Tuple[List[dict], int, Dict[str, List[dict]]]:
+    print(f"Processing house: {house_path}")
+    house = load_house(house_path)
+
+    controller_kwargs = {
+        "scene": house,
+        "width": args.width,
+        "height": args.height,
+        "connect_timeout": args.connect_timeout,
+        "visibilityDistance": args.visibility_distance,
+    }
+    if args.x_display is not None:
+        controller_kwargs["x_display"] = args.x_display
+
+    controller = Controller(**controller_kwargs)
+    qa_entries: List[dict] = []
+    category_entries: Dict[str, List[dict]] = {key: [] for key in CATEGORY_TEMPLATES}
+    generated_samples = 0
+    failure_count = 0
+    max_failures = args.num_samples * 12
+
+    try:
+        while generated_samples < args.num_samples and failure_count < max_failures:
+            randomize_start(controller, rng)
+            before_event = controller.last_event
+            if before_event is None:
+                raise RuntimeError("Controller did not return an event after Teleport.")
+
+            actions = sample_action_sequence(sequences, rng)
+
+            try:
+                attempt_actions(controller, actions)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Action sequence failed for {house_path.name}: {exc}")
+                failure_count += 1
+                continue
+
+            after_event = controller.last_event
+            if after_event is None:
+                raise RuntimeError("Controller did not produce an event after actions.")
+
+            agent_before = before_event.metadata["agent"]
+            agent_after = after_event.metadata["agent"]
+
+            sequence_index = start_index + generated_samples
+            sample_tag = f"camera_{sequence_index:06d}"
+
+            img1_path = args.output_dir / f"{sample_tag}_img1.png"
+            img2_path = args.output_dir / f"{sample_tag}_img2.png"
+            save_frame(before_event.frame, img1_path)
+            save_frame(after_event.frame, img2_path)
+
+            base_dir = args.qa_json.parent if args.qa_json else args.qa_root
+            rel_img1 = os.path.relpath(img1_path, base_dir).replace("\\", "/")
+            rel_img2 = os.path.relpath(img2_path, base_dir).replace("\\", "/")
+            images_rel = [rel_img1, rel_img2]
+
+            motion_metrics = compute_motion_metrics(agent_before, agent_after)
+            rotation_summary = summarize_action_rotations(actions)
+            action_yaw = rotation_summary["action_yaw_deg"]
+            action_pitch = rotation_summary["action_pitch_deg"]
+
+            dir_answer = motion_metrics["direction_label"]
+            dist_answer_mm = motion_metrics["distance_mm"]
+            rot_dir_answer = rotation_direction(
+                motion_metrics["delta_yaw_deg"],
+                motion_metrics["delta_horizon_deg"],
+                action_yaw,
+                action_pitch,
+            )
+
+            vertical_value = (
+                action_pitch if abs(action_pitch) > VERTICAL_MIN_THRESHOLD else motion_metrics["delta_horizon_deg"]
+            )
+            deg_answer_value = abs(vertical_value)
+
+            motion_metadata = {
+                key: motion_metrics[key]
+                for key in (
+                    "delta_position_meters",
+                    "distance_meters",
+                    "distance_mm",
+                    "planar_distance_meters",
+                    "initial_yaw_deg",
+                    "final_yaw_deg",
+                    "delta_yaw_deg",
+                    "delta_horizon_deg",
+                    "direction_label",
+                )
+            }
+            motion_metadata.update(
+                {
+                    "action_yaw_deg": action_yaw,
+                    "action_pitch_deg": action_pitch,
+                    "rotation_label": rot_dir_answer,
+                }
+            )
+
+            metadata = {
+                "house": house_path.stem,
+                "actions": [
+                    {"action": spec["action"], "params": dict(spec.get("params", {}))}
+                    for spec in actions
+                ],
+                "motion": motion_metadata,
+            }
+
+            created_any = False
+
+            if motion_metrics["planar_distance_meters"] > TRANSLATION_MIN_PLANAR:
+                question_text = rng.choice(CATEGORY_TEMPLATES["Dir"])
+                options, correct_label = build_direction_options(dir_answer, rng)
+                entry = create_choice_entry(
+                    sample_tag,
+                    "Dir",
+                    question_text,
+                    options,
+                    correct_label,
+                    images_rel,
+                    metadata,
+                )
+                qa_entries.append(entry)
+                category_entries["Dir"].append(copy.deepcopy(entry))
+                created_any = True
+
+            if motion_metrics["distance_meters"] > DISTANCE_MIN_THRESHOLD:
+                question_text = rng.choice(CATEGORY_TEMPLATES["Dist"])
+                options, correct_label = build_distance_options(dist_answer_mm, rng)
+                entry = create_choice_entry(
+                    sample_tag,
+                    "Dist",
+                    question_text,
+                    options,
+                    correct_label,
+                    images_rel,
+                    metadata,
+                )
+                qa_entries.append(entry)
+                category_entries["Dist"].append(copy.deepcopy(entry))
+                created_any = True
+
+            if (
+                max(abs(motion_metrics["delta_yaw_deg"]), abs(action_yaw)) > ROT_DIR_MIN_YAW
+                or max(abs(motion_metrics["delta_horizon_deg"]), abs(action_pitch)) > ROT_DIR_MIN_HORIZON
+            ):
+                question_text = rng.choice(CATEGORY_TEMPLATES["RotDir"])
+                options, correct_label = build_rotation_options(rot_dir_answer, rng)
+                entry = create_choice_entry(
+                    sample_tag,
+                    "RotDir",
+                    question_text,
+                    options,
+                    correct_label,
+                    images_rel,
+                    metadata,
+                )
+                qa_entries.append(entry)
+                category_entries["RotDir"].append(copy.deepcopy(entry))
+                created_any = True
+
+            if max(abs(motion_metrics["delta_horizon_deg"]), abs(action_pitch)) > VERTICAL_MIN_THRESHOLD:
+                question_text = rng.choice(CATEGORY_TEMPLATES["Deg"])
+                options, correct_label = build_degree_options(deg_answer_value, rng)
+                entry = create_choice_entry(
+                    sample_tag,
+                    "Deg",
+                    question_text,
+                    options,
+                    correct_label,
+                    images_rel,
+                    metadata,
+                )
+                qa_entries.append(entry)
+                category_entries["Deg"].append(copy.deepcopy(entry))
+                created_any = True
+
+            if created_any:
+                generated_samples += 1
+            else:
+                failure_count += 1
+
+    finally:
+        controller.stop()
+
+    if generated_samples < args.num_samples:
+        print(
+            f"Warning: only generated {generated_samples} / {args.num_samples} sample sets for house {house_path.name}."
+        )
+
+    return qa_entries, generated_samples, category_entries
+def main() -> None:
+    args = parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.qa_root.mkdir(parents=True, exist_ok=True)
+    if args.qa_json is not None:
+        args.qa_json.parent.mkdir(parents=True, exist_ok=True)
+
+    random.seed(args.seed)
+    rng = random.Random(args.seed)
+
+    sequences = load_sequences(args.sequences)
+    house_paths = collect_house_paths(args.house_json)
+
+    qa_entries: List[dict] = []
+    category_totals: Dict[str, List[dict]] = {key: [] for key in CATEGORY_TEMPLATES}
+    total_samples = 0
+
+    output_json = args.qa_json or (args.qa_root / "qa_pairs.json")
+
+    for house_path in house_paths:
+        try:
+            house_entries, produced, category_entries = generate_samples_for_house(
+                house_path, args, sequences, rng, total_samples
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Failed to generate samples for {house_path}: {exc}")
+            continue
+
+        qa_entries.extend(house_entries)
+        for key in CATEGORY_TEMPLATES:
+            category_totals[key].extend(category_entries[key])
+        total_samples += produced
+
+        write_combined_entries(qa_entries, output_json)
+        print(f"Appended {len(house_entries)} entries -> {output_json}")
+
+    for category, entries in category_totals.items():
+        category_dir = args.qa_root / category
+        category_dir.mkdir(parents=True, exist_ok=True)
+        category_path = category_dir / "qa_pairs.json"
+        write_combined_entries(entries, category_path)
+        print(f"Saved {len(entries)} entries for category {category} -> {category_path}")
+
+    print(f"Saved total {len(qa_entries)} QA pairs to {output_json}")
 
 
 def load_house(path: Path) -> dict:
@@ -196,8 +642,6 @@ def load_sequences(path: Path | None) -> Optional[Sequence[Tuple[ActionSpec, ...
             raise ValueError("Each custom sequence must be a list of actions.")
         sequences.append(normalize_sequence(seq))
     return sequences
-
-
 def save_frame(frame, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(frame).save(destination)
@@ -402,188 +846,6 @@ def compute_motion_metrics(agent_before: dict, agent_after: dict) -> dict:
         "delta_horizon_deg": delta_horizon,
         "direction_label": direction_label,
     }
-
-
-def format_distance_mm(value: int) -> str:
-    return f"`{value}` mm"
-
-
-def format_degrees(value: float) -> str:
-    if math.isclose(value, 0.0, abs_tol=1e-6):
-        return "0 degrees"
-    if float(value).is_integer():
-        return f"{int(value)} degrees"
-    return f"{value:.2f} degrees"
-
-
-def main() -> None:
-    args = parse_args()
-    random.seed(args.seed)
-    rng = random.Random(args.seed)
-
-    sequences = load_sequences(args.sequences)
-    house = load_house(args.house_json)
-
-    controller_kwargs = {
-        "scene": house,
-        "width": args.width,
-        "height": args.height,
-        "connect_timeout": args.connect_timeout,
-        "visibilityDistance": args.visibility_distance,
-    }
-    if args.x_display is not None:
-        controller_kwargs["x_display"] = args.x_display
-
-    controller = Controller(**controller_kwargs)
-    qa_entries: List[dict] = []
-    category_entries = {key: [] for key in CATEGORY_TEMPLATES}
-
-    try:
-        for idx in range(args.num_samples):
-            randomize_start(controller, rng)
-
-            before_event = controller.last_event
-            if before_event is None:
-                raise RuntimeError("Controller did not return an event after Teleport.")
-
-            agent_before = before_event.metadata["agent"]
-
-            image1_path = args.output_dir / f"sample_{idx:04d}_before.png"
-            save_frame(before_event.frame, image1_path)
-
-            actions = sample_action_sequence(sequences, rng)
-            attempt_actions(controller, actions)
-
-            after_event = controller.last_event
-            if after_event is None:
-                raise RuntimeError("Controller did not produce an event after actions.")
-
-            agent_after = after_event.metadata["agent"]
-            image2_path = args.output_dir / f"sample_{idx:04d}_after.png"
-            save_frame(after_event.frame, image2_path)
-
-            motion_metrics = compute_motion_metrics(agent_before, agent_after)
-            action_rotation_summary = summarize_action_rotations(actions)
-            action_yaw = action_rotation_summary["action_yaw_deg"]
-            action_pitch = action_rotation_summary["action_pitch_deg"]
-
-            dir_question = rng.choice(CATEGORY_TEMPLATES["Dir"])
-            dist_question = rng.choice(CATEGORY_TEMPLATES["Dist"])
-            rot_dir_question = rng.choice(CATEGORY_TEMPLATES["RotDir"])
-            deg_question = rng.choice(CATEGORY_TEMPLATES["Deg"])
-
-            dir_answer = motion_metrics["direction_label"]
-            dist_answer = format_distance_mm(motion_metrics["distance_mm"])
-            rot_dir_answer = rotation_direction(
-                motion_metrics["delta_yaw_deg"],
-                motion_metrics["delta_horizon_deg"],
-                action_yaw,
-                action_pitch,
-            )
-
-            vertical_value = (
-                action_pitch
-                if abs(action_pitch) > VERTICAL_MIN_THRESHOLD
-                else motion_metrics["delta_horizon_deg"]
-            )
-            deg_answer = format_degrees(abs(vertical_value))
-
-            shared_payload = {
-                "image_1_path": str(image1_path.resolve()),
-                "image_2_path": str(image2_path.resolve()),
-                "actions": [
-                    {"action": spec["action"], "params": dict(spec.get("params", {}))}
-                    for spec in actions
-                ],
-            }
-
-            motion_metadata = {
-                key: motion_metrics[key]
-                for key in (
-                    "delta_position_meters",
-                    "distance_meters",
-                    "distance_mm",
-                    "planar_distance_meters",
-                    "initial_yaw_deg",
-                    "final_yaw_deg",
-                    "delta_yaw_deg",
-                    "delta_horizon_deg",
-                    "direction_label",
-                )
-            }
-            motion_metadata["action_yaw_deg"] = action_yaw
-            motion_metadata["action_pitch_deg"] = action_pitch
-            motion_metadata["rotation_label"] = rot_dir_answer
-
-            qa_list: List[dict] = []
-
-            if motion_metrics["planar_distance_meters"] > TRANSLATION_MIN_PLANAR:
-                entry = {
-                    **shared_payload,
-                    "question": dir_question,
-                    "answer": dir_answer,
-                    "metadata": motion_metadata,
-                }
-                category_entries["Dir"].append(entry)
-                qa_list.append({"question": dir_question, "answer": dir_answer, "category": "Dir"})
-
-            if motion_metrics["distance_meters"] > DISTANCE_MIN_THRESHOLD:
-                entry = {
-                    **shared_payload,
-                    "question": dist_question,
-                    "answer": dist_answer,
-                    "metadata": motion_metadata,
-                }
-                category_entries["Dist"].append(entry)
-                qa_list.append({"question": dist_question, "answer": dist_answer, "category": "Dist"})
-
-            if (
-                max(abs(motion_metrics["delta_yaw_deg"]), abs(action_yaw)) > ROT_DIR_MIN_YAW
-                or max(abs(motion_metrics["delta_horizon_deg"]), abs(action_pitch))
-                > ROT_DIR_MIN_HORIZON
-            ):
-                entry = {
-                    **shared_payload,
-                    "question": rot_dir_question,
-                    "answer": rot_dir_answer,
-                    "metadata": motion_metadata,
-                }
-                category_entries["RotDir"].append(entry)
-                qa_list.append({"question": rot_dir_question, "answer": rot_dir_answer, "category": "RotDir"})
-
-            if max(abs(motion_metrics["delta_horizon_deg"]), abs(action_pitch)) > VERTICAL_MIN_THRESHOLD:
-                entry = {
-                    **shared_payload,
-                    "question": deg_question,
-                    "answer": deg_answer,
-                    "metadata": motion_metadata,
-                }
-                category_entries["Deg"].append(entry)
-                qa_list.append({"question": deg_question, "answer": deg_answer, "category": "Deg"})
-
-            if qa_list:
-                qa_entries.append(
-                    {
-                        **shared_payload,
-                        "metadata": motion_metadata,
-                        "qa": qa_list,
-                    }
-                )
-
-        qa_root = args.qa_root
-        for category, entries in category_entries.items():
-            category_dir = qa_root / category
-            category_dir.mkdir(parents=True, exist_ok=True)
-            category_path = category_dir / "qa_pairs.json"
-            category_path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
-            print(f"Saved {len(entries)} QA pairs to {category_path}")
-
-        if args.qa_json is not None:
-            args.qa_json.parent.mkdir(parents=True, exist_ok=True)
-            args.qa_json.write_text(json.dumps(qa_entries, indent=2), encoding="utf-8")
-            print(f"Saved combined QA log to {args.qa_json}")
-    finally:
-        controller.stop()
 
 
 if __name__ == "__main__":

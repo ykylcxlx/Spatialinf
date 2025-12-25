@@ -2,17 +2,20 @@
 
 
 
-# python generate_corr_point_qas.py houses/train_000.json --output-dir ../outputs/corr_point/images --qa-root ../outputs/corr_point --num-samples 20 --visibility-distance 10 --connect-timeout 300 --x-display :1 --qa-json ../outputs/corr_point/all_tasks.json
+# python generate_corr_point_qas.py houses/train_000.json --output-dir ../outputs/corr_point/images --qa-root ../outputs/corr_point --num-samples 20 --visibility-distance 10 --connect-timeout 300 --x-display :99 --qa-json ../outputs/corr_point/all_tasks.json
 from __future__ import annotations
 
 import argparse
 import json
 import math
+import os
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from ai2thor.controller import Controller
@@ -30,6 +33,7 @@ OPPOSITE_TRANSLATIONS = {
     "MoveLeft": "MoveRight",
     "MoveRight": "MoveLeft",
 }
+LABEL_FONT_SIZE = 28
 
 QUESTION_TEMPLATES: Sequence[str] = (
     "[Corr Point] Match the point from image 1 with the correct point in image 2.",
@@ -47,6 +51,8 @@ COORD_TEMPLATES: Sequence[str] = (
     "[Corr Coord] 请选择图2中与图1 区域 {bbox} 相匹配的边界框。",
     "[Corr Coord]Which candidate bbox in image 2 matches the object covering {bbox} in image 1?",
 )
+
+CHOICE_LETTERS: Tuple[str, ...] = ("A", "B", "C", "D")
 
 OBJECT_TEMPLATES: Sequence[str] = (
     "[Corr Object]What object exists in both images?",
@@ -106,7 +112,11 @@ class LabeledPoint:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("house_json", type=Path, help="Path to a ProcTHOR house JSON file.")
+    parser.add_argument(
+        "house_json",
+        type=Path,
+        help="Path to a ProcTHOR house JSON file or a directory containing multiple JSON files.",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -151,13 +161,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--width",
         type=int,
-        default=600,
+        default=512,
         help="Viewport width for rendered frames.",
     )
     parser.add_argument(
         "--height",
         type=int,
-        default=600,
+        default=512,
         help="Viewport height for rendered frames.",
     )
     parser.add_argument(
@@ -180,6 +190,24 @@ def load_house(path: Path) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"House JSON not found: {path}")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def collect_house_paths(path: Path) -> List[Path]:
+    if path.is_dir():
+        candidates = sorted(p for p in path.glob("*.json") if p.is_file())
+        if not candidates:
+            raise FileNotFoundError(f"No JSON files found in directory: {path}")
+        return candidates
+    if path.is_file() and path.suffix.lower() == ".json":
+        return [path]
+    raise FileNotFoundError(f"Expected a JSON file or directory, got: {path}")
+
+
+def write_combined_entries(entries: Sequence[dict], target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
 
 def normalize_action_spec(spec: Any) -> ActionSpec:
@@ -330,6 +358,107 @@ def extract_visible_objects(event) -> Dict[str, VisibleObject]:
     return result
 
 
+def load_label_font(size: int) -> ImageFont.ImageFont:
+    for font_name in ("DejaVuSans-Bold.ttf", "DejaVuSans.ttf", "Arial.ttf"):
+        try:
+            return ImageFont.truetype(font_name, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def format_bbox(
+    bbox: Optional[Tuple[float, float, float, float]],
+    width: int,
+    height: int,
+) -> str:
+    if bbox is None:
+        return "[unknown]"
+    x1, y1, x2, y2 = bbox
+    denom_w = max(float(width) - 1.0, 1.0)
+    denom_h = max(float(height) - 1.0, 1.0)
+    normalized = [
+        max(0.0, min(1.0, x1 / denom_w)),
+        max(0.0, min(1.0, y1 / denom_h)),
+        max(0.0, min(1.0, x2 / denom_w)),
+        max(0.0, min(1.0, y2 / denom_h)),
+    ]
+    return "[" + ", ".join(f"{value:.2f}" for value in normalized) + "]"
+
+
+def humanize_object_name(raw_name: Optional[str]) -> str:
+    if not raw_name:
+        return "Object"
+    name = raw_name.replace("_", " ")
+    name = re.sub(r"(?<!^)(?=[A-Z])", " ", name)
+    words = [word.capitalize() for word in name.split()]
+    return " ".join(words) if words else "Object"
+
+
+def build_object_options(
+    target_object_type: Optional[str],
+    labeled_points: Sequence[LabeledPoint],
+    rng: random.Random,
+) -> Tuple[List[Tuple[str, str]], str]:
+    correct_name = humanize_object_name(target_object_type)
+    options: List[Tuple[str, bool]] = [(correct_name, True)]
+    seen = {correct_name.lower()}
+
+    for point in labeled_points:
+        if point.is_correct:
+            continue
+        if point.object_type:
+            candidate = humanize_object_name(point.object_type)
+            lowered = candidate.lower()
+            if lowered not in seen:
+                options.append((candidate, False))
+                seen.add(lowered)
+
+    pool = list(OBJECT_DISTRACTOR_POOL)
+    rng.shuffle(pool)
+    for candidate in pool:
+        candidate_name = humanize_object_name(candidate)
+        lowered = candidate_name.lower()
+        if lowered in seen:
+            continue
+        options.append((candidate_name, False))
+        seen.add(lowered)
+        if len(options) >= len(CHOICE_LETTERS):
+            break
+
+    while len(options) < len(CHOICE_LETTERS):
+        filler = f"Item {len(options) + 1}"
+        if filler.lower() in seen:
+            filler = f"Choice {len(options) + 1}"
+        options.append((filler, False))
+        seen.add(options[-1][0].lower())
+
+    rng.shuffle(options)
+
+    try:
+        correct_index = next(i for i, (_, flag) in enumerate(options) if flag)
+    except StopIteration:
+        correct_index = 0
+
+    if correct_index >= len(CHOICE_LETTERS):
+        options[0], options[correct_index] = options[correct_index], options[0]
+        correct_index = 0
+
+    trimmed = options[: len(CHOICE_LETTERS)]
+    labeled_options: List[Tuple[str, str]] = []
+    correct_label = ""
+    for letter, (name, is_correct) in zip(CHOICE_LETTERS, trimmed):
+        labeled_options.append((letter, name))
+        if is_correct:
+            correct_label = letter
+
+    if not correct_label:
+        labeled_options[0] = (CHOICE_LETTERS[0], correct_name)
+        correct_label = CHOICE_LETTERS[0]
+
+    return labeled_options, correct_label
+
+
 def too_close(point: Tuple[float, float], others: Sequence[Tuple[float, float]]) -> bool:
     return any(math.hypot(point[0] - ox, point[1] - oy) < MIN_POINT_SPACING for ox, oy in others)
 
@@ -343,28 +472,6 @@ def random_screen_point(width: int, height: int, rng: random.Random, existing: S
         if not too_close(candidate, existing):
             return candidate
     return (width / 2.0, height / 2.0)
-
-
-def clamp_bbox(bbox: Tuple[float, float, float, float], width: int, height: int) -> Tuple[float, float, float, float]:
-    x1, y1, x2, y2 = bbox
-    return (
-        max(0.0, min(width, x1)),
-        max(0.0, min(height, y1)),
-        max(0.0, min(width, x2)),
-        max(0.0, min(height, y2)),
-    )
-
-
-def normalize_bbox(bbox: Tuple[float, float, float, float], width: int, height: int) -> Tuple[float, float, float, float]:
-    x1, y1, x2, y2 = clamp_bbox(bbox, width, height)
-    if width <= 0 or height <= 0:
-        return (0.0, 0.0, 0.0, 0.0)
-    return (x1 / width, y1 / height, x2 / width, y2 / height)
-
-
-def format_bbox(bbox: Tuple[float, float, float, float], width: int, height: int) -> str:
-    nx1, ny1, nx2, ny2 = normalize_bbox(bbox, width, height)
-    return f"[{nx1:.2f}, {ny1:.2f}, {nx2:.2f}, {ny2:.2f}]"
 
 
 def select_common_object(
@@ -386,7 +493,7 @@ def build_point_choices(
     height: int,
     rng: random.Random,
 ) -> Tuple[List[LabeledPoint], str]:
-    letters = ["A", "B", "C", "D"]
+    letters = list(CHOICE_LETTERS)
     points: List[LabeledPoint] = []
     centers_so_far: List[Tuple[float, float]] = []
 
@@ -471,7 +578,7 @@ def draw_annotations(
 
     draw_before = ImageDraw.Draw(before_copy)
     draw_after = ImageDraw.Draw(after_copy)
-    font = ImageFont.load_default()
+    font = load_label_font(LABEL_FONT_SIZE)
 
     bx, by = target_before.center
     bx_i, by_i = int(round(bx)), int(round(by))
@@ -500,7 +607,10 @@ def draw_annotations(
             outline=(255, 255, 255),
             width=2,
         )
-        text_position = (px_i + POINT_RADIUS_PIXELS + 4, py_i - POINT_RADIUS_PIXELS - 4)
+        text_position = (
+            px_i + POINT_RADIUS_PIXELS + 6,
+            py_i - (POINT_RADIUS_PIXELS + LABEL_FONT_SIZE // 2),
+        )
         draw_after.text(text_position, point.label, fill=(255, 255, 0), font=font)
 
     return before_copy, after_copy
@@ -510,13 +620,24 @@ def build_question(rng: random.Random) -> str:
     return rng.choice(QUESTION_TEMPLATES)
 
 
-def main() -> None:
-    args = parse_args()
-    random.seed(args.seed)
-    rng = random.Random(args.seed)
+def save_depth_image(depth_frame: np.ndarray, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if depth_frame is None:
+        return
+    depth_m = np.nan_to_num(depth_frame, nan=0.0, posinf=0.0, neginf=0.0)
+    depth_mm = np.clip(depth_m * 1000.0, 0.0, 65535.0).astype(np.uint16)
+    Image.fromarray(depth_mm).save(destination)
 
-    sequences = load_sequences(args.sequences)
-    house = load_house(args.house_json)
+
+def generate_samples_for_house(
+    house_path: Path,
+    args: argparse.Namespace,
+    sequences: Optional[Sequence[Tuple[ActionSpec, ...]]],
+    rng: random.Random,
+    start_index: int,
+) -> Tuple[List[dict], int]:
+    print(f"Processing house: {house_path}")
+    house = load_house(house_path)
 
     controller_kwargs = {
         "scene": house,
@@ -525,20 +646,23 @@ def main() -> None:
         "connect_timeout": args.connect_timeout,
         "visibilityDistance": args.visibility_distance,
         "renderInstanceSegmentation": True,
+        "renderDepthImage": True,
     }
     if args.x_display is not None:
         controller_kwargs["x_display"] = args.x_display
 
     controller = Controller(**controller_kwargs)
-    category_entries: Dict[str, List[dict]] = {"CorrPoint": [], "CorrCoord": [], "CorrObject": []}
-    combined_entries: List[dict] = []
+    qa_entries: List[dict] = []
+    generated_samples = 0
 
     try:
         failure_count = 0
         max_failures = args.num_samples * MAX_SAMPLE_ATTEMPTS
-        while len(category_entries["CorrPoint"]) < args.num_samples:
+        while generated_samples < args.num_samples:
             if failure_count >= max_failures:
-                print("Stopping early: exceeded maximum failure attempts.")
+                print(
+                    f"Stopping early for {house_path.name}: exceeded maximum failure attempts ({max_failures})."
+                )
                 break
 
             randomize_start(controller, rng)
@@ -571,181 +695,157 @@ def main() -> None:
                 before_image, after_image, target_before, labeled_points
             )
 
-            sample_idx = len(category_entries["CorrPoint"])
-            img1_path = args.output_dir / f"sample_{sample_idx:04d}_img1.png"
-            img2_path = args.output_dir / f"sample_{sample_idx:04d}_img2.png"
+            global_sample_idx = start_index + generated_samples
+            sample_tag = f"sample_{global_sample_idx:06d}"
+            img1_path = args.output_dir / f"{sample_tag}_img1.png"
+            img2_path = args.output_dir / f"{sample_tag}_img2.png"
             img1_path.parent.mkdir(parents=True, exist_ok=True)
             annotated_before.save(img1_path)
             annotated_after.save(img2_path)
 
-            question_text = build_question(rng)
-            target_bbox_before_pixels = clamp_bbox(target_before.bbox, args.width, args.height)
-            target_bbox_after_pixels = clamp_bbox(target_after.bbox, args.width, args.height)
+            depth1_path = args.output_dir / f"{sample_tag}_img1_depth.png"
+            depth2_path = args.output_dir / f"{sample_tag}_img2_depth.png"
+            save_depth_image(before_event.depth_frame, depth1_path)
+            save_depth_image(after_event.depth_frame, depth2_path)
 
-            points_metadata: List[Dict[str, Any]] = []
-            for point in labeled_points:
-                point_bbox_pixels = clamp_bbox(point.bbox, args.width, args.height) if point.bbox else clamp_bbox(
-                    (
-                        point.x - POINT_RADIUS_PIXELS,
-                        point.y - POINT_RADIUS_PIXELS,
-                        point.x + POINT_RADIUS_PIXELS,
-                        point.y + POINT_RADIUS_PIXELS,
-                    ),
-                    args.width,
-                    args.height,
-                )
-                point_bbox_normalized = normalize_bbox(point_bbox_pixels, args.width, args.height)
-                points_metadata.append(
-                    {
-                        "label": point.label,
-                        "x": point.x,
-                        "y": point.y,
-                        "is_correct": point.is_correct,
-                        "source": point.source,
-                        "object_id": point.object_id,
-                        "object_type": point.object_type,
-                        "bbox_pixels": point_bbox_pixels,
-                        "bbox_normalized": point_bbox_normalized,
-                    }
-                )
+            base_dir = args.qa_json.parent if args.qa_json else args.output_dir
+            rel_img1 = os.path.relpath(img1_path, base_dir)
+            rel_img2 = os.path.relpath(img2_path, base_dir)
+            rel_depth1 = os.path.relpath(depth1_path, base_dir)
+            rel_depth2 = os.path.relpath(depth2_path, base_dir)
+            images_rel = [rel_img1.replace("\\", "/"), rel_img2.replace("\\", "/")]
+            depths_rel = [rel_depth1.replace("\\", "/"), rel_depth2.replace("\\", "/")]
 
-            coord_options_strings: List[str] = []
-            coord_answer_string = ""
-            for point_info in points_metadata:
-                option_string = f"{point_info['label']}. {format_bbox(point_info['bbox_pixels'], args.width, args.height)}"
-                coord_options_strings.append(option_string)
-                if point_info["is_correct"]:
-                    coord_answer_string = option_string
+            correct_point = next((point for point in labeled_points if point.is_correct), None)
+            if correct_point is None:
+                raise RuntimeError("No correct labeled point was generated.")
+            id_prefix = f"corr_point_{global_sample_idx:06d}"
+            prompt_prefix = "<image>Image 1.<image>Image 2."
 
-            if not coord_answer_string and coord_options_strings:
-                coord_answer_string = coord_options_strings[0]
-
-            target_object_display = target_after.object_type or target_after.name or target_after.object_id
-            target_object_name = target_after.name or target_object_display
-            target_object_type = target_after.object_type or target_object_display
-
-            object_option_candidates: List[str] = []
-            for obj in after_objects.values():
-                candidate_name = obj.object_type or obj.name or obj.object_id
-                if not candidate_name:
-                    continue
-                candidate_name_str = str(candidate_name)
-                if candidate_name_str not in object_option_candidates:
-                    object_option_candidates.append(candidate_name_str)
-
-            object_options_list: List[str] = []
-            if target_object_type:
-                object_options_list.append(str(target_object_type))
-            for candidate in object_option_candidates:
-                if len(object_options_list) >= 4:
-                    break
-                if candidate == target_object_type:
-                    continue
-                object_options_list.append(candidate)
-
-            if len(object_options_list) < 4:
-                for fallback in OBJECT_DISTRACTOR_POOL:
-                    if len(object_options_list) >= 4:
-                        break
-                    if fallback == target_object_type or fallback in object_options_list:
-                        continue
-                    object_options_list.append(fallback)
-
-            rng.shuffle(object_options_list)
-            object_answer_string = str(target_object_type or "Unknown")
-            if object_answer_string not in object_options_list:
-                object_options_list = [object_answer_string] + [opt for opt in object_options_list if opt != object_answer_string]
-                object_options_list = object_options_list[:4]
-                rng.shuffle(object_options_list)
-
-            object_options_list = object_options_list[:4]
-            if not object_options_list:
-                object_options_list = [object_answer_string or "Unknown"]
-
-            metadata = {
-                "target_object_id": target_after.object_id,
-                "target_object_type": target_object_type,
-                "target_object_display": target_object_display,
-                "target_object_name": target_object_name,
-                "target_point_before": {
-                    "x": target_before.center[0],
-                    "y": target_before.center[1],
-                },
-                "target_point_after": {
-                    "x": target_after.center[0],
-                    "y": target_after.center[1],
-                },
-                "target_bbox_before_pixels": target_bbox_before_pixels,
-                "target_bbox_before_normalized": normalize_bbox(target_bbox_before_pixels, args.width, args.height),
-                "target_bbox_after_pixels": target_bbox_after_pixels,
-                "target_bbox_after_normalized": normalize_bbox(target_bbox_after_pixels, args.width, args.height),
-                "points": points_metadata,
-                "coord_options": coord_options_strings,
-                "object_options": list(object_options_list),
-            }
-
-            shared_payload = {
-                "image_1_path": str(img1_path.resolve()),
-                "image_2_path": str(img2_path.resolve()),
-                "actions": [
-                    {"action": spec.action, "params": dict(spec.params)} for spec in actions
-                ],
-                "metadata": metadata,
-            }
-
-            corr_point_entry = {
-                **shared_payload,
-                "category": "CorrPoint",
-                "question": question_text,
-                "answer": correct_label,
-                "options": [point.label for point in labeled_points],
-            }
-            category_entries["CorrPoint"].append(corr_point_entry)
-            combined_entries.append(corr_point_entry)
+            point_question = build_question(rng)
+            point_options_text = " ".join(
+                f"({point.label}) point {point.label}" for point in labeled_points
+            )
+            point_answer = f"({correct_label}) point {correct_label}"
+            qa_entries.append(
+                {
+                    "id": f"{id_prefix}_point",
+                    "images": images_rel,
+                    "depths": depths_rel,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": f"{prompt_prefix} {point_question} {point_options_text}",
+                        },
+                        {"role": "assistant", "content": point_answer},
+                    ],
+                }
+            )
 
             coord_question = rng.choice(COORD_TEMPLATES).format(
-                bbox=format_bbox(target_bbox_before_pixels, args.width, args.height)
+                bbox=format_bbox(target_before.bbox, args.width, args.height)
             )
-            coord_entry = {
-                **shared_payload,
-                "category": "CorrCoord",
-                "question": coord_question,
-                "answer": coord_answer_string,
-                "options": list(coord_options_strings),
-            }
-            category_entries["CorrCoord"].append(coord_entry)
-            combined_entries.append(coord_entry)
+            coord_options_text = " ".join(
+                f"({point.label}) bbox {format_bbox(point.bbox, args.width, args.height)}"
+                for point in labeled_points
+            )
+            coord_answer = (
+                f"({correct_label}) bbox {format_bbox(correct_point.bbox, args.width, args.height)}"
+            )
+            qa_entries.append(
+                {
+                    "id": f"{id_prefix}_bbox",
+                    "images": images_rel,
+                    "depths": depths_rel,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": f"{prompt_prefix} {coord_question} {coord_options_text}",
+                        },
+                        {"role": "assistant", "content": coord_answer},
+                    ],
+                }
+            )
 
+            object_options, object_correct_label = build_object_options(
+                target_after.object_type, labeled_points, rng
+            )
             object_question = rng.choice(OBJECT_TEMPLATES)
-            object_entry = {
-                **shared_payload,
-                "category": "CorrObject",
-                "question": object_question,
-                "answer": object_answer_string,
-                "options": list(object_options_list),
-            }
-            category_entries["CorrObject"].append(object_entry)
-            combined_entries.append(object_entry)
+            object_options_text = " ".join(
+                f"({letter}) {name}" for letter, name in object_options
+            )
+            default_object_name = humanize_object_name(target_after.object_type)
+            object_answer_name = next(
+                (name for letter, name in object_options if letter == object_correct_label),
+                default_object_name,
+            )
+            object_answer = f"({object_correct_label}) {object_answer_name}"
+            qa_entries.append(
+                {
+                    "id": f"{id_prefix}_object",
+                    "images": images_rel,
+                    "depths": depths_rel,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": f"{prompt_prefix} {object_question} {object_options_text}",
+                        },
+                        {"role": "assistant", "content": object_answer},
+                    ],
+                }
+            )
 
             print(
-                f"Generated sample {sample_idx:04d} across CorrPoint/CorrCoord/CorrObject with target {target_object_display}."
+                "House {house} sample {idx:04d}: point={point_label}, bbox={bbox_label}, object={object_label} ({object_name}).".format(
+                    house=house_path.stem,
+                    idx=generated_samples,
+                    point_label=correct_label,
+                    bbox_label=correct_label,
+                    object_label=object_correct_label,
+                    object_name=object_answer_name,
+                )
             )
 
-        for category, entries in category_entries.items():
-            category_dir = args.qa_root / category
-            category_dir.mkdir(parents=True, exist_ok=True)
-            qa_path = category_dir / "qa_pairs.json"
-            qa_path.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
-            print(f"Saved {len(entries)} {category} QA pairs to {qa_path}")
+            generated_samples += 1
 
-        if args.qa_json is not None:
-            args.qa_json.parent.mkdir(parents=True, exist_ok=True)
-            args.qa_json.write_text(
-                json.dumps(combined_entries, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-            print(f"Saved combined QA log to {args.qa_json}")
     finally:
         controller.stop()
+
+    if generated_samples < args.num_samples:
+        print(
+            f"Warning: only generated {generated_samples} / {args.num_samples} sample sets for house {house_path.name}."
+        )
+
+    return qa_entries, generated_samples
+
+
+def main() -> None:
+    args = parse_args()
+    random.seed(args.seed)
+    rng = random.Random(args.seed)
+
+    sequences = load_sequences(args.sequences)
+    house_paths = collect_house_paths(args.house_json)
+
+    qa_entries: List[dict] = []
+    total_samples = 0
+    output_json = args.qa_json or (args.output_dir / "qa_pairs.json")
+
+    for house_path in house_paths:
+        try:
+            house_entries, produced = generate_samples_for_house(
+                house_path, args, sequences, rng, total_samples
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Failed to generate samples for {house_path}: {exc}")
+            continue
+
+        qa_entries.extend(house_entries)
+        total_samples += produced
+        write_combined_entries(qa_entries, output_json)
+        print(f"Appended {len(house_entries)} entries -> {output_json}")
+
+    print(f"Saved total {len(qa_entries)} QA pairs to {output_json}")
 
 
 if __name__ == "__main__":
