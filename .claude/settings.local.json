@@ -3,7 +3,14 @@
     "allow": [
       "Bash(python generate_metric_qas.py:*)",
       "Bash(python generate_spatial_qas.py:*)",
-      "Bash(python test_qas.py:*)"
+      "Bash(python test_qas.py:*)",
+      "Bash(ssh:*)",
+      "Bash(dir:*)",
+      "Bash(findstr:*)",
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(timeout 120 python:*)",
+      "Bash(git add:*)"
     ]
   }
 }
