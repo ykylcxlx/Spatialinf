@@ -13,6 +13,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from PIL import Image
 
+import numpy as np
+
 from ai2thor.controller import Controller
 
 # python procthordata/generate_camera_qas.py \
@@ -22,7 +24,7 @@ from ai2thor.controller import Controller
 #   --num-samples 3 \
 #   --visibility-distance 10 \
 #   --connect-timeout 300 \
-#   --x-display :1 \
+#   --x-display :99 \
 #   --qa-json outputs/cam_motion/all_tasks.json
 
 # Action pools for random sequence generation (all rotations < 90°).
@@ -337,6 +339,7 @@ def create_choice_entry(
     options: Sequence[Tuple[str, str]],
     correct_label: str,
     images: Sequence[str],
+    depths: Sequence[str],
     metadata: Dict[str, Any],
 ) -> dict:
     options_text = format_options_text(options)
@@ -345,6 +348,7 @@ def create_choice_entry(
         "id": f"{sample_tag}_{question_type.lower()}",
         "question_type": question_type,
         "images": list(images),
+        "depths": list(depths),
         "metadata": copy.deepcopy(metadata),
         "messages": [
             {
@@ -373,6 +377,7 @@ def generate_samples_for_house(
         "height": args.height,
         "connect_timeout": args.connect_timeout,
         "visibilityDistance": args.visibility_distance,
+        "renderDepthImage": True,
     }
     if args.x_display is not None:
         controller_kwargs["x_display"] = args.x_display
@@ -415,10 +420,18 @@ def generate_samples_for_house(
             save_frame(before_event.frame, img1_path)
             save_frame(after_event.frame, img2_path)
 
+            depth1_path = args.output_dir / f"{sample_tag}_img1_depth.png"
+            depth2_path = args.output_dir / f"{sample_tag}_img2_depth.png"
+            save_depth_image(before_event.depth_frame, depth1_path)
+            save_depth_image(after_event.depth_frame, depth2_path)
+
             base_dir = args.qa_json.parent if args.qa_json else args.qa_root
             rel_img1 = os.path.relpath(img1_path, base_dir).replace("\\", "/")
             rel_img2 = os.path.relpath(img2_path, base_dir).replace("\\", "/")
             images_rel = [rel_img1, rel_img2]
+            rel_depth1 = os.path.relpath(depth1_path, base_dir).replace("\\", "/")
+            rel_depth2 = os.path.relpath(depth2_path, base_dir).replace("\\", "/")
+            depths_rel = [rel_depth1, rel_depth2]
 
             motion_metrics = compute_motion_metrics(agent_before, agent_after)
             rotation_summary = summarize_action_rotations(actions)
@@ -482,6 +495,7 @@ def generate_samples_for_house(
                     options,
                     correct_label,
                     images_rel,
+                    depths_rel,
                     metadata,
                 )
                 qa_entries.append(entry)
@@ -498,6 +512,7 @@ def generate_samples_for_house(
                     options,
                     correct_label,
                     images_rel,
+                    depths_rel,
                     metadata,
                 )
                 qa_entries.append(entry)
@@ -517,6 +532,7 @@ def generate_samples_for_house(
                     options,
                     correct_label,
                     images_rel,
+                    depths_rel,
                     metadata,
                 )
                 qa_entries.append(entry)
@@ -533,6 +549,7 @@ def generate_samples_for_house(
                     options,
                     correct_label,
                     images_rel,
+                    depths_rel,
                     metadata,
                 )
                 qa_entries.append(entry)
@@ -645,6 +662,15 @@ def load_sequences(path: Path | None) -> Optional[Sequence[Tuple[ActionSpec, ...
 def save_frame(frame, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(frame).save(destination)
+
+
+def save_depth_image(depth_frame: np.ndarray, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if depth_frame is None:
+        return
+    depth_m = np.nan_to_num(depth_frame, nan=0.0, posinf=0.0, neginf=0.0)
+    depth_mm = np.clip(depth_m * 1000.0, 0.0, 65535.0).astype(np.uint16)
+    Image.fromarray(depth_mm).save(destination)
 
 
 def wrapped_angle(delta: float) -> float:

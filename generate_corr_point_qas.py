@@ -82,6 +82,9 @@ DISTRACTOR_TARGET = 3
 MIN_POINT_SPACING = 24.0
 MAX_SAMPLE_ATTEMPTS = 12
 
+# 某些对象类型（例如墙面）不适合作为正确答案，提前过滤掉
+EXCLUDED_OBJECT_TYPES: Tuple[str, ...] = ("Wall",)
+
 
 @dataclass(frozen=True)
 class ActionSpec:
@@ -479,7 +482,15 @@ def select_common_object(
 ) -> Optional[Tuple[VisibleObject, VisibleObject]]:
     before_objects = extract_visible_objects(before_event)
     after_objects = extract_visible_objects(after_event)
-    common_ids = [obj_id for obj_id in before_objects if obj_id in after_objects]
+    common_ids: List[str] = []
+    for obj_id, before_obj in before_objects.items():
+        after_obj = after_objects.get(obj_id)
+        if after_obj is None:
+            continue
+        # 跳过指定类型（如墙面），避免生成墙作为正确答案
+        if before_obj.object_type in EXCLUDED_OBJECT_TYPES or after_obj.object_type in EXCLUDED_OBJECT_TYPES:
+            continue
+        common_ids.append(obj_id)
     if not common_ids:
         return None
     target_id = rng.choice(common_ids)
