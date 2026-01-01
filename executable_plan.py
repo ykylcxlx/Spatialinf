@@ -1,3 +1,4 @@
+import argparse
 import math
 import re
 import shutil
@@ -8,8 +9,7 @@ import cv2
 import numpy as np
 from ai2thor.controller import Controller
 from scipy.spatial import distance
-from typing import Tuple
-from collections import deque
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import random
 import os
 import copy
@@ -20,15 +20,43 @@ from pathlib import Path
 import prior
 
 
-PROC_THOR_SPLIT = os.environ.get("PROCTHOR_SPLIT", "train")
-PROC_THOR_HOUSE_INDEX = 15
+def _resolve_split(default: str = "train") -> str:
+    for key in ("PROC_THOR_SPLIT", "PROCTHOR_SPLIT"):
+        value = os.environ.get(key)
+        if value:
+            return value
+    return default
+
+
+def _resolve_house_index(default: int = 0) -> int:
+    for key in ("PROC_THOR_HOUSE_INDEX", "PROCTHOR_HOUSE_INDEX"):
+        value = os.environ.get(key)
+        if value is None:
+            continue
+        try:
+            return max(0, int(value))
+        except ValueError:
+            print(f"[WARN] Invalid {key}='{value}'; falling back to {default}")
+            break
+    return default
+
+
+PROC_THOR_SPLIT = _resolve_split()
+PROC_THOR_HOUSE_INDEX = _resolve_house_index()
 _DATASET = prior.load_dataset("procthor-10k")
-_PROC_SCENE = _DATASET[PROC_THOR_SPLIT][PROC_THOR_HOUSE_INDEX]
+try:
+    _SPLIT_SCENES = _DATASET[PROC_THOR_SPLIT]
+except Exception as exc:
+    raise KeyError(f"Split '{PROC_THOR_SPLIT}' not found in ProcTHOR dataset") from exc
+if not 0 <= PROC_THOR_HOUSE_INDEX < len(_SPLIT_SCENES):
+    raise IndexError(
+        f"House index {PROC_THOR_HOUSE_INDEX} is out of range for split '{PROC_THOR_SPLIT}'"
+    )
+_PROC_SCENE = _SPLIT_SCENES[PROC_THOR_HOUSE_INDEX]
 _SCENE_ID = str(_PROC_SCENE.get("id", f"{PROC_THOR_SPLIT}_{PROC_THOR_HOUSE_INDEX}"))
 
 
 # floor_no = 15
-
 
 def _extract_scene_object_basenames(scene_payload: dict):
     names = set()
@@ -98,25 +126,112 @@ def closest_node(node, nodes, no_robot, clost_node_location):
 def distance_pts(p1: Tuple[float, float, float], p2: Tuple[float, float, float]):
     return ((p1[0] - p2[0]) ** 2 + (p1[2] - p2[2]) ** 2) ** 0.5
 
-def generate_video():
-    frame_rate = 5
+
+def _select_navigation_target(
+    controller: Controller,
+    exclude: Sequence[str],
+    min_distance: float = 4.5,
+) -> Tuple[str, str]:
+    event = controller.last_event
+    objects = event.metadata.get("objects", [])
+    agent_positions: List[Tuple[float, float, float]] = []
+    agent_room_types: List[str] = []
+    for agent_event in getattr(event, "events", []) or []:
+        agent_meta = agent_event.metadata.get("agent", {})
+        position = agent_meta.get("position", {})
+        agent_positions.append(
+            (
+                float(position.get("x", 0.0)),
+                float(position.get("y", 0.0)),
+                float(position.get("z", 0.0)),
+            )
+        )
+        room_type = agent_meta.get("room") or agent_meta.get("roomType")
+        if isinstance(room_type, str):
+            agent_room_types.append(room_type)
+
+    excluded = set(exclude)
+    candidates: List[Tuple[str, str, float]] = []
+    for obj in objects:
+        object_id = obj.get("objectId")
+        if not object_id:
+            continue
+        base_name = object_id.split("|")[0]
+        if base_name in excluded:
+            continue
+        aabb = obj.get("axisAlignedBoundingBox", {})
+        center = aabb.get("center") if isinstance(aabb, dict) else None
+        if not center:
+            continue
+        center_pos = (
+            float(center.get("x", 0.0)),
+            float(center.get("y", 0.0)),
+            float(center.get("z", 0.0)),
+        )
+        room_type = obj.get("roomType") or obj.get("room")
+        if agent_room_types and isinstance(room_type, str) and room_type in agent_room_types:
+            continue
+        if agent_positions:
+            min_dist = min(distance_pts(agent_pos, center_pos) for agent_pos in agent_positions)
+            if min_dist < min_distance:
+                continue
+        else:
+            min_dist = 0.0
+        candidates.append((object_id, base_name, min_dist))
+
+    if candidates:
+        max_dist = max(candidate[2] for candidate in candidates)
+        far_candidates = [candidate for candidate in candidates if max_dist - candidate[2] < 0.5]
+        chosen_id, chosen_name, _ = random.choice(far_candidates or candidates)
+        return chosen_id, chosen_name
+
+    # Fallback to previous behaviour if no candidate satisfies the distance constraint.
+    fallback_name = _choose_random_object_name(_PROC_SCENE, excluded=excluded)
+    for obj in objects:
+        object_id = obj.get("objectId")
+        if object_id and object_id.startswith(f"{fallback_name}|"):
+            return object_id, fallback_name
+    return fallback_name, fallback_name
+
+def generate_video(frame_rate: int, destinations: Optional[Dict[str, Path]] = None) -> Dict[str, Path]:
+    produced: Dict[str, Path] = {}
     if not _RUN_OUTPUT_ROOT.exists():
         print(f"The output directory {_RUN_OUTPUT_ROOT} does not exist; skipping video generation.")
-        return
+        return produced
     for imgs_folder in sorted(_RUN_OUTPUT_ROOT.iterdir()):
         if not imgs_folder.is_dir():
             continue
         if not any(imgs_folder.glob("img_*.png")):
             continue
         view = imgs_folder.name
+        output_path = _RUN_OUTPUT_ROOT / f"video_{view}.mp4"
         command_set = [
-            'ffmpeg',
-            '-i', str(imgs_folder / 'img_%05d.png'),
-            '-framerate', str(frame_rate),
-            '-pix_fmt', 'yuv420p',
-            str(_RUN_OUTPUT_ROOT / f'video_{view}.mp4'),
+            "ffmpeg",
+            "-y",
+            "-framerate",
+            str(frame_rate),
+            "-i",
+            str(imgs_folder / "img_%05d.png"),
+            "-pix_fmt",
+            "yuv420p",
+            str(output_path),
         ]
         subprocess.call(command_set)
+        dest_key = None
+        if view.startswith("agent_"):
+            dest_key = "agent"
+        elif view.startswith("top_view"):
+            dest_key = "top_view"
+
+        final_path = output_path
+        if destinations and dest_key and dest_key in destinations:
+            target_path = destinations[dest_key]
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            if target_path != output_path:
+                shutil.copy2(output_path, target_path)
+            final_path = target_path
+        produced[dest_key or view] = final_path
+    return produced
         
 
 
@@ -148,23 +263,18 @@ try:
 except NameError:
     _PLAN_DIR = os.getcwd()
 
-_RANDOM_NAV_TARGET = _choose_random_object_name(_PROC_SCENE, excluded={"Mug"})
+DEFAULT_OUTPUT_BASE = Path(
+    os.environ.get(
+        "PROCTHOR_VIDEO_OUTPUT",
+        Path(__file__).resolve().parents[1] / "outputs" / "video",
+    )
+)
 
-_OUTPUT_BASE = Path("/data5/zhuangyunhao/outputs/video")
-_OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
-_SANITIZED_SCENE_ID = _sanitize_label(_SCENE_ID)
-_SANITIZED_TARGET = _sanitize_label(_RANDOM_NAV_TARGET)
-_RUN_TIMESTAMP = time.strftime("%Y%m%d_%H%M%S")
-_RUN_SUFFIX = f"{_SANITIZED_SCENE_ID}_{_SANITIZED_TARGET}_{_RUN_TIMESTAMP}"
-_RUN_OUTPUT_ROOT = _OUTPUT_BASE / _RUN_SUFFIX
-_RUN_INFO = {
-    "house_id": _SCENE_ID,
-    "split": PROC_THOR_SPLIT,
-    "house_index": PROC_THOR_HOUSE_INDEX,
-    "nav_target": _RANDOM_NAV_TARGET,
-    "run_suffix": _RUN_SUFFIX,
-    "output_root": str(_RUN_OUTPUT_ROOT),
-}
+_RANDOM_NAV_TARGET: Optional[str] = None
+_RANDOM_NAV_TARGET_ID: Optional[str] = None
+_RUN_OUTPUT_ROOT: Optional[Path] = None
+_RUN_INFO: Dict[str, Any] = {}
+_RUN_SUFFIX: Optional[str] = None
 
 
 _DISPLAY_CANDIDATES = []
@@ -196,64 +306,20 @@ def _create_controller(**kwargs):
 total_exec = 0
 success_exec = 0
 
-c = _create_controller(height=1000, width=1000)
-c.reset(scene=_PROC_SCENE)
+c: Optional[Controller] = None
 no_robot = len(robots)
-
-# initialize n agents into the scene
-multi_agent_event = c.step(dict(action='Initialize', agentMode="default", snapGrid=False, gridSize=0.5, rotateStepDegrees=20, visibilityDistance=1000, fieldOfView=180, agentCount=no_robot))
-
-# add a top view camera
-_HAS_TOP_VIEW = False
-event = c.step(action="GetMapViewCameraProperties", raise_for_failure=True)
-try:
-    top_view_props = copy.deepcopy(event.metadata["actionReturn"])
-    bounds = event.metadata.get("sceneBounds", {}).get("size", {})
-    max_bound = max(bounds.get("x", 0), bounds.get("z", 0), 1)
-    top_view_props["orthographic"] = False
-    top_view_props["fieldOfView"] = 50
-    top_view_props["position"]["y"] += 1.1 * max_bound
-    top_view_props["farClippingPlane"] = 50
-    top_view_props.pop("orthographicSize", None)
-    event = c.step(
-        action="AddThirdPartyCamera",
-        skyboxColor="white",
-        raise_for_failure=True,
-        **top_view_props,
-    )
-    _HAS_TOP_VIEW = True
-except Exception as _camera_err:
-    print(f"[WARN] Failed to add third-party camera: {_camera_err}")
-    _HAS_TOP_VIEW = False
-
-# get reachabel positions
-reachable_positions_ = c.step(action="GetReachablePositions").metadata["actionReturn"]
-reachable_positions = positions_tuple = [(p["x"], p["y"], p["z"]) for p in reachable_positions_]
-
-# randomize postions of the agents
-for i in range (no_robot):
-    init_pos = random.choice(reachable_positions_)
-    c.step(dict(action="Teleport", position=init_pos, agentId=i))
-    
-objs = list([obj["objectId"] for obj in c.last_event.metadata["objects"]])
-# print (objs)
-    
-# x = c.step(dict(action="RemoveFromScene", objectId='Lettuce|+01.11|+00.83|-01.43'))
-#c.step({"action":"InitialRandomSpawn", "excludedReceptacles":["Microwave", "Pan", "Chair", "Plate", "Fridge", "Cabinet", "Drawer", "GarbageCan"]})
-# c.step({"action":"InitialRandomSpawn", "excludedReceptacles":["Cabinet", "Drawer", "GarbageCan"]})
-
-action_queue = []
-
+reachable_positions: List[Tuple[float, float, float]] = []
+action_queue: List[Dict[str, Any]] = []
 task_over = False
-
-recp_id = None
-
-for i in range (no_robot):
-    multi_agent_event = c.step(action="LookDown", degrees=35, agentId=i)
-    # c.step(action="LookUp", degrees=30, 'agent_id':i)
+recp_id: Optional[str] = None
+_HAS_TOP_VIEW = False
 
 def exec_actions():
     global total_exec, success_exec
+    if _RUN_OUTPUT_ROOT is None:
+        raise RuntimeError("_RUN_OUTPUT_ROOT is not set before exec_actions start")
+    if _RUN_SUFFIX is None:
+        raise RuntimeError("_RUN_SUFFIX is not set before exec_actions start")
     run_dir = _RUN_OUTPUT_ROOT
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -418,7 +484,7 @@ def exec_actions():
 actions_thread = threading.Thread(target=exec_actions)
 actions_thread.start()
 
-def GoToObject(robots, dest_obj):
+def GoToObject(robots, dest_obj, max_iterations: int = 400):
     global recp_id
     
     # check if robots is a list
@@ -436,11 +502,28 @@ def GoToObject(robots, dest_obj):
     # list of objects in the scene and their centers
     objs = list([obj["objectId"] for obj in c.last_event.metadata["objects"]])
     objs_center = list([obj["axisAlignedBoundingBox"]["center"] for obj in c.last_event.metadata["objects"]])
+    dest_obj_center = None
     if "|" in dest_obj:
-        # obj alredy given
+        # full object id supplied; attempt to use metadata center
         dest_obj_id = dest_obj
-        pos_arr = dest_obj_id.split("|")
-        dest_obj_center = {'x': float(pos_arr[1]), 'y': float(pos_arr[2]), 'z': float(pos_arr[3])}
+        for idx, obj in enumerate(objs):
+            if obj == dest_obj_id:
+                candidate_center = objs_center[idx]
+                if candidate_center and candidate_center != {'x': 0.0, 'y': 0.0, 'z': 0.0}:
+                    dest_obj_center = candidate_center
+                break
+        if dest_obj_center is None:
+            pos_components = dest_obj_id.split("|")[1:]
+            coords: List[float] = []
+            for comp in pos_components:
+                try:
+                    coords.append(float(comp))
+                except (TypeError, ValueError):
+                    continue
+                if len(coords) == 3:
+                    break
+            if len(coords) == 3:
+                dest_obj_center = {'x': coords[0], 'y': coords[1], 'z': coords[2]}
     else:
         for idx, obj in enumerate(objs):
             
@@ -450,6 +533,9 @@ def GoToObject(robots, dest_obj):
                 dest_obj_center = objs_center[idx]
                 if dest_obj_center != {'x': 0.0, 'y': 0.0, 'z': 0.0}:
                     break # find the first instance
+
+    if dest_obj_center is None:
+        raise RuntimeError(f"Unable to determine center for object '{dest_obj}'.")
         
     print ("Going to ", dest_obj_id, dest_obj_center)
         
@@ -460,10 +546,15 @@ def GoToObject(robots, dest_obj):
     # differt close points needs to be found for each robot
     crp = closest_node(dest_obj_pos, reachable_positions, no_agents, clost_node_location)
     
-    goal_thresh = 0.5
+    goal_thresh = 1.0
     # at least one robot is far away from the goal
     
+    iteration = 0
     while all(d > goal_thresh for d in dist_goals):
+        iteration += 1
+        if iteration > max_iterations:
+            print("[WARN] Navigation loop exceeded max_iterations; stopping early.")
+            break
         for ia, robot in enumerate(robots):
             robot_name = robot['name']
             agent_id = int(robot_name[-1]) - 1
@@ -743,27 +834,26 @@ def ThrowObject(robot, sw_obj):
     
     action_queue.append({'action':'ThrowObject', 'objectId':sw_obj_id, 'agent_id':agent_id}) 
     time.sleep(1)
-def goto(robot):
-    print(f"[INFO] Navigating to randomly selected object: {_RANDOM_NAV_TARGET}")
-    GoToObject(robot, _RANDOM_NAV_TARGET)
+def goto(robot, max_iterations: int = 400):
+    target_label = _RANDOM_NAV_TARGET
+    target_identifier = _RANDOM_NAV_TARGET_ID or target_label
+    if target_identifier is None:
+        raise RuntimeError("Navigation target has not been selected before calling goto().")
+    print(f"[INFO] Navigating to selected object: {target_label or target_identifier}")
+    GoToObject(robot, target_identifier, max_iterations=max_iterations)
 
-# Execute the task using Robot 2
-goto(robots[0])
-
-# Task "Put mug in the coffee machine and switch on the coffee machine" is done
-
-# ---- Action queue instrumentation (auto-injected) ----
 import threading as _aq_th
 import json as _aq_json
 from datetime import datetime as _aq_dt
+
 
 class _ActionQueue(list):
     def __init__(self, *args, _log_path=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._log_path = _log_path
         self._lock = _aq_th.Lock()
-        self._counts = {}
-        self._per_agent = {}
+        self._counts: Dict[str, int] = {}
+        self._per_agent: Dict[int, int] = {}
         self._total = 0
 
     def append(self, item):
@@ -777,10 +867,10 @@ class _ActionQueue(list):
                 self._per_agent[ag] = self._per_agent.get(ag, 0) + 1
             if self._log_path and isinstance(item, dict):
                 try:
-                    with open(self._log_path, 'a') as f:
+                    with open(self._log_path, 'a', encoding='utf-8') as f:
                         rec = dict(ts=_aq_dt.now().isoformat(), **item)
                         f.write(_aq_json.dumps(rec, ensure_ascii=False) + '\n')
-                except Exception as _e:
+                except Exception:
                     # non-fatal
                     pass
         return super().append(item)
@@ -789,29 +879,265 @@ class _ActionQueue(list):
         with self._lock:
             return dict(total=self._total, by_action=self._counts, by_agent=self._per_agent)
 
-_action_log_file = os.path.join(os.path.dirname(__file__), 'actions_log.jsonl')
-try:
-    if os.path.exists(_action_log_file):
-        os.remove(_action_log_file)
-except Exception:
-    pass
 
-try:
-    action_queue = _ActionQueue(action_queue, _log_path=_action_log_file)
-except NameError:
-    # In case action_queue not yet defined, create a new one
-    action_queue = _ActionQueue([], _log_path=_action_log_file)
-# ---- end instrumentation ----
-no_trans = 1
-
-for i in range(25):
-    action_queue.append({'action':'Done'})
-    action_queue.append({'action':'Done'})
-    action_queue.append({'action':'Done'})
-    time.sleep(0.1)
-
-task_over = True
-time.sleep(5)
+def instrument_action_queue(queue: List[Dict[str, Any]], log_dir: Optional[Path] = None) -> _ActionQueue:
+    if log_dir is None:
+        log_dir = Path(__file__).resolve().parent
+    action_log_file = log_dir / 'actions_log.jsonl'
+    try:
+        if action_log_file.exists():
+            action_log_file.unlink()
+    except Exception:
+        pass
+    if isinstance(queue, _ActionQueue):
+        queue._log_path = str(action_log_file)
+        return queue
+    return _ActionQueue(queue, _log_path=str(action_log_file))
 
 
-generate_video()
+def _next_video_index(video_output_dir: Path) -> int:
+    max_index = 0
+    for subdir in ("agent", "top_view"):
+        folder = video_output_dir / subdir
+        if not folder.exists():
+            continue
+        for candidate in folder.glob("*.mp4"):
+            stem = candidate.stem
+            if stem.isdigit():
+                max_index = max(max_index, int(stem))
+    return max_index + 1
+
+
+def run_episode(
+    output_base: Path = DEFAULT_OUTPUT_BASE,
+    video_output_dir: Optional[Path] = None,
+    agent_prefix: str = "agent_1",
+    frame_rate: int = 5,
+    done_repetitions: int = 25,
+    nav_exclude: Optional[Sequence[str]] = None,
+    random_seed: Optional[int] = None,
+    min_nav_distance: float = 4.5,
+    max_nav_iterations: int = 400,
+    video_filename_stem: Optional[str] = None,
+) -> Dict[str, Any]:
+    global total_exec, success_exec, c, no_robot, action_queue, task_over, _RUN_OUTPUT_ROOT, _RUN_INFO, _RUN_SUFFIX, _RANDOM_NAV_TARGET, recp_id, _HAS_TOP_VIEW, reachable_positions, _RANDOM_NAV_TARGET_ID
+
+    if nav_exclude is None:
+        nav_exclude_set = {"Mug"}
+    else:
+        nav_exclude_set = set(nav_exclude)
+    if random_seed is not None:
+        random.seed(random_seed)
+        np.random.seed(random_seed)
+
+    output_base = Path(output_base)
+    output_base.mkdir(parents=True, exist_ok=True)
+    sanitized_scene_id = _sanitize_label(_SCENE_ID)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+    total_exec = 0
+    success_exec = 0
+    task_over = False
+    recp_id = None
+    action_queue = []
+
+    video_destinations: Optional[Dict[str, Path]] = None
+    video_index: Optional[int] = None
+    sanitized_stem: Optional[str] = None
+    if video_output_dir is not None:
+        video_output_dir = Path(video_output_dir)
+        if video_filename_stem:
+            sanitized_stem = _sanitize_label(video_filename_stem)
+        if sanitized_stem:
+            video_destinations = {
+                "agent": video_output_dir / "agent" / f"{sanitized_stem}.mp4",
+                "top_view": video_output_dir / "top_view" / f"{sanitized_stem}.mp4",
+            }
+        else:
+            sanitized_stem = None
+            video_index = _next_video_index(video_output_dir)
+            video_destinations = {
+                "agent": video_output_dir / "agent" / f"{video_index:04d}.mp4",
+                "top_view": video_output_dir / "top_view" / f"{video_index:04d}.mp4",
+            }
+
+    actions_thread: Optional[threading.Thread] = None
+    produced_videos: Dict[str, Path] = {}
+    run_output_root: Optional[Path] = None
+    run_suffix: str = ""
+    run_info: Dict[str, Any] = {}
+    random_nav_target: Optional[str] = None
+
+    try:
+        c = _create_controller(height=1000, width=1000)
+        c.reset(scene=_PROC_SCENE)
+        no_robot = len(robots)
+
+        multi_agent_event = c.step(dict(action='Initialize', agentMode="default", snapGrid=False, gridSize=0.5, rotateStepDegrees=20, visibilityDistance=1000, fieldOfView=180, agentCount=no_robot))
+
+        _HAS_TOP_VIEW = False
+        try:
+            event = c.step(action="GetMapViewCameraProperties", raise_for_failure=True)
+            top_view_props = copy.deepcopy(event.metadata["actionReturn"])
+            bounds = event.metadata.get("sceneBounds", {}).get("size", {})
+            max_bound = max(bounds.get("x", 0), bounds.get("z", 0), 1)
+            top_view_props["orthographic"] = False
+            top_view_props["fieldOfView"] = 50
+            top_view_props["position"]["y"] += 1.1 * max_bound
+            top_view_props["farClippingPlane"] = 50
+            top_view_props.pop("orthographicSize", None)
+            c.step(
+                action="AddThirdPartyCamera",
+                skyboxColor="white",
+                raise_for_failure=True,
+                **top_view_props,
+            )
+            _HAS_TOP_VIEW = True
+        except Exception as _camera_err:
+            print(f"[WARN] Failed to add third-party camera: {_camera_err}")
+            _HAS_TOP_VIEW = False
+
+        reachable_positions_ = c.step(action="GetReachablePositions").metadata["actionReturn"]
+        reachable_positions = [(p["x"], p["y"], p["z"]) for p in reachable_positions_]
+
+        for i in range(no_robot):
+            init_pos = random.choice(reachable_positions_)
+            c.step(dict(action="Teleport", position=init_pos, agentId=i))
+
+        for i in range(no_robot):
+            c.step(action="LookDown", degrees=35, agentId=i)
+
+        target_id, target_name = _select_navigation_target(c, sorted(nav_exclude_set), min_distance=min_nav_distance)
+        sanitized_target = _sanitize_label(target_name or target_id)
+        run_suffix = f"{sanitized_scene_id}_{sanitized_target}_{timestamp}"
+        run_output_root = output_base / run_suffix
+        run_output_root.mkdir(parents=True, exist_ok=True)
+
+        run_info = {
+            "house_id": _SCENE_ID,
+            "split": PROC_THOR_SPLIT,
+            "house_index": PROC_THOR_HOUSE_INDEX,
+            "nav_target": target_name,
+            "run_suffix": run_suffix,
+            "output_root": str(run_output_root),
+        }
+
+        _RUN_OUTPUT_ROOT = run_output_root
+        _RUN_INFO = run_info
+        _RUN_SUFFIX = run_suffix
+        random_nav_target = target_name
+        _RANDOM_NAV_TARGET = target_name
+        _RANDOM_NAV_TARGET_ID = target_id
+
+        actions_thread = threading.Thread(target=exec_actions, daemon=True)
+        actions_thread.start()
+
+        goto(robots[0], max_iterations=max_nav_iterations)
+
+        action_queue = instrument_action_queue(action_queue, run_output_root)
+
+        for _ in range(done_repetitions):
+            action_queue.append({'action':'Done'})
+            action_queue.append({'action':'Done'})
+            action_queue.append({'action':'Done'})
+            time.sleep(0.1)
+
+        task_over = True
+        if actions_thread.is_alive():
+            actions_thread.join()
+
+        produced_videos = generate_video(frame_rate, video_destinations)
+    finally:
+        task_over = True
+        if actions_thread and actions_thread.is_alive():
+            actions_thread.join()
+        cv2.destroyAllWindows()
+        try:
+            c.stop()
+        except Exception:
+            pass
+
+    if run_output_root is None:
+        raise RuntimeError("Run output directory was not initialized.")
+    agent_dirs = [run_output_root / f"agent_{i + 1}_{run_suffix}" for i in range(no_robot)]
+    top_view_dir = run_output_root / f"top_view_{run_suffix}"
+
+    random_nav_target = random_nav_target or _RANDOM_NAV_TARGET
+    run_info = run_info or _RUN_INFO
+
+    result = {
+        "run_output_root": str(run_output_root),
+        "agent_dirs": [str(path) for path in agent_dirs if path.exists()],
+        "top_view_dir": str(top_view_dir) if top_view_dir.exists() else None,
+        "video_paths": {key: str(path) for key, path in produced_videos.items()},
+        "run_suffix": run_suffix,
+        "random_nav_target": random_nav_target,
+        "run_info": run_info,
+        "video_index": video_index,
+        "agent_prefix": agent_prefix,
+        "video_filename_stem": sanitized_stem,
+    }
+
+    return result
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Execute ProcTHOR plan and record episode data.")
+    parser.add_argument(
+        "--output-base",
+        type=Path,
+        default=DEFAULT_OUTPUT_BASE,
+        help="Directory where per-run frame dumps are stored.",
+    )
+    parser.add_argument(
+        "--video-output-dir",
+        type=Path,
+        help="Directory where rendered videos should be saved (agent/ and top_view/ subdirectories will be created).",
+    )
+    parser.add_argument(
+        "--frame-rate",
+        type=int,
+        default=5,
+        help="Frame rate used when rendering MP4 videos.",
+    )
+    parser.add_argument(
+        "--done-repetitions",
+        type=int,
+        default=25,
+        help="Number of Done action triplets to append before terminating the episode.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="Random seed for reproducibility.",
+    )
+    parser.add_argument(
+        "--nav-exclude",
+        nargs="*",
+        default=["Mug"],
+        help="Object basenames to exclude when sampling the navigation target.",
+    )
+    parser.add_argument(
+        "--agent-prefix",
+        default="agent_1",
+        help="Agent directory prefix (default: agent_1).",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    result = run_episode(
+        output_base=args.output_base,
+        video_output_dir=args.video_output_dir,
+        agent_prefix=args.agent_prefix,
+        frame_rate=args.frame_rate,
+        done_repetitions=args.done_repetitions,
+        nav_exclude=args.nav_exclude,
+        random_seed=args.seed,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
