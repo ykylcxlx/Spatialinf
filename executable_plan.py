@@ -16,6 +16,8 @@ import copy
 import json
 from pathlib import Path
 
+from typing import Set
+
 
 import prior
 
@@ -54,6 +56,118 @@ if not 0 <= PROC_THOR_HOUSE_INDEX < len(_SPLIT_SCENES):
     )
 _PROC_SCENE = _SPLIT_SCENES[PROC_THOR_HOUSE_INDEX]
 _SCENE_ID = str(_PROC_SCENE.get("id", f"{PROC_THOR_SPLIT}_{PROC_THOR_HOUSE_INDEX}"))
+
+
+def _compute_polygon_area(points: Sequence[Dict[str, Any]]) -> float:
+    if not points or len(points) < 3:
+        return 0.0
+    coords: List[Tuple[float, float]] = []
+    for entry in points:
+        try:
+            x_val = float(entry.get("x", 0.0))
+            z_val = float(entry.get("z", 0.0))
+        except (TypeError, ValueError):
+            continue
+        coords.append((x_val, z_val))
+    if len(coords) < 3:
+        return 0.0
+    area = 0.0
+    for idx, (x0, z0) in enumerate(coords):
+        x1, z1 = coords[(idx + 1) % len(coords)]
+        area += (x0 * z1) - (x1 * z0)
+    return abs(area) * 0.5
+
+
+def _build_room_lookup(scene_payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for index, room in enumerate(scene_payload.get("rooms", []) or []):
+        raw_id = room.get("id")
+        if isinstance(raw_id, str) and raw_id.strip():
+            room_id = raw_id.strip()
+        else:
+            room_id = f"room|{index}"
+        floor_polygon = room.get("floorPolygon") or []
+        lookup[room_id] = {
+            "id": room_id,
+            "roomType": room.get("roomType"),
+            "floorMaterial": room.get("floorMaterial"),
+            "area": _compute_polygon_area(floor_polygon),
+        }
+    return lookup
+
+
+def _normalize_room_id(room_identifier: Optional[str]) -> Optional[str]:
+    if not room_identifier:
+        return None
+    if not isinstance(room_identifier, str):
+        return None
+    trimmed = room_identifier.strip()
+    if not trimmed:
+        return None
+    if "|" not in trimmed:
+        return trimmed
+    parts = trimmed.split("|")
+    if len(parts) >= 2 and parts[0].lower() == "room":
+        return "|".join(parts[:2])
+    return trimmed
+
+
+_ROOM_LOOKUP: Dict[str, Dict[str, Any]] = _build_room_lookup(_PROC_SCENE)
+_TOTAL_ROOMS = len(_ROOM_LOOKUP)
+
+_ROOM_VISIT_LOCK = threading.Lock()
+_ROOM_VISITED_SET: Set[str] = set()
+_ROOM_VISIT_ORDER: List[str] = []
+_ROOM_TIMELINE: List[Dict[str, Any]] = []
+_AGENT_ROOM_SEQUENCES: Dict[int, List[str]] = {}
+
+
+def _reset_room_tracking() -> None:
+    global _ROOM_VISITED_SET, _ROOM_VISIT_ORDER, _ROOM_TIMELINE, _AGENT_ROOM_SEQUENCES
+    with _ROOM_VISIT_LOCK:
+        _ROOM_VISITED_SET = set()
+        _ROOM_VISIT_ORDER = []
+        _ROOM_TIMELINE = []
+        _AGENT_ROOM_SEQUENCES = {}
+
+
+def _record_room_visit(
+    agent_index: int,
+    agent_name: str,
+    raw_room_id: Optional[str],
+    raw_room_type: Optional[str],
+    frame_index: int,
+) -> None:
+    normalized_id = _normalize_room_id(raw_room_id)
+    resolved_id = normalized_id or (raw_room_id.strip() if isinstance(raw_room_id, str) else None)
+    room_info = _ROOM_LOOKUP.get(resolved_id) if resolved_id else None
+    resolved_type = (
+        raw_room_type
+        or (room_info.get("roomType") if isinstance(room_info, dict) else None)
+    )
+    if not resolved_id and not resolved_type:
+        return
+    with _ROOM_VISIT_LOCK:
+        if resolved_id:
+            if resolved_id not in _ROOM_VISITED_SET:
+                _ROOM_VISITED_SET.add(resolved_id)
+                _ROOM_VISIT_ORDER.append(resolved_id)
+        timeline_entry: Dict[str, Any] = {
+            "frame_index": frame_index,
+            "agent_index": agent_index,
+            "agent_name": agent_name,
+        }
+        if resolved_id:
+            timeline_entry["room_id"] = resolved_id
+        if resolved_type:
+            timeline_entry["room_type"] = resolved_type
+        if room_info:
+            timeline_entry["room_area"] = room_info.get("area")
+        _ROOM_TIMELINE.append(timeline_entry)
+        if resolved_id:
+            seq = _AGENT_ROOM_SEQUENCES.setdefault(agent_index, [])
+            if not seq or seq[-1] != resolved_id:
+                seq.append(resolved_id)
 
 
 # floor_no = 15
@@ -454,6 +568,18 @@ def exec_actions():
                 frame_root = agent_dirs[i] / frame_basename
                 cv2.imwrite(str(frame_root.with_suffix(".png")), e.cv2img)
                 visible_ids = _visible_object_ids(e)
+                # attempt to read agent room info from event metadata
+                agent_meta = (getattr(e, "metadata", {}) or {}).get("agent", {})
+                raw_room_id = agent_meta.get("room") or agent_meta.get("roomType")
+                room_id = _normalize_room_id(raw_room_id)
+                room_info = _ROOM_LOOKUP.get(room_id) if room_id else None
+                room_type = agent_meta.get("roomType") or (room_info.get("roomType") if room_info else None)
+                room_area = room_info.get("area") if room_info else None
+                # record visit into module-level trackers
+                try:
+                    _record_room_visit(i, robots[i]["name"], raw_room_id, room_type, img_counter)
+                except Exception:
+                    pass
                 metadata = {
                     "agent_id": i,
                     "agent_name": robots[i]["name"],
@@ -462,6 +588,12 @@ def exec_actions():
                     "house_id": _SCENE_ID,
                     "nav_target": _RANDOM_NAV_TARGET,
                 }
+                if room_id:
+                    metadata["room_id"] = room_id
+                if room_type:
+                    metadata["room_type"] = room_type
+                if room_area is not None:
+                    metadata["room_area"] = room_area
                 with open(frame_root.with_suffix(".json"), "w", encoding="utf-8") as meta_file:
                     json.dump(metadata, meta_file, ensure_ascii=False, indent=2)
             frames = []
@@ -921,6 +1053,7 @@ def run_episode(
     video_filename_stem: Optional[str] = None,
 ) -> Dict[str, Any]:
     global total_exec, success_exec, c, no_robot, action_queue, task_over, _RUN_OUTPUT_ROOT, _RUN_INFO, _RUN_SUFFIX, _RANDOM_NAV_TARGET, recp_id, _HAS_TOP_VIEW, reachable_positions, _RANDOM_NAV_TARGET_ID
+    global _ROOM_VISITED_SET, _ROOM_VISIT_ORDER, _ROOM_TIMELINE, _AGENT_ROOM_SEQUENCES
 
     if nav_exclude is None:
         nav_exclude_set = {"Mug"}
@@ -940,6 +1073,7 @@ def run_episode(
     task_over = False
     recp_id = None
     action_queue = []
+    _reset_room_tracking()
 
     video_destinations: Optional[Dict[str, Path]] = None
     video_index: Optional[int] = None
@@ -1021,6 +1155,15 @@ def run_episode(
             "run_suffix": run_suffix,
             "output_root": str(run_output_root),
         }
+        # include static room information discovered from the scene payload
+        try:
+            rooms_list = []
+            for rid, info in _ROOM_LOOKUP.items():
+                rooms_list.append({"id": rid, "roomType": info.get("roomType"), "area": info.get("area")})
+            run_info["total_rooms"] = _TOTAL_ROOMS
+            run_info["rooms"] = rooms_list
+        except Exception:
+            pass
 
         _RUN_OUTPUT_ROOT = run_output_root
         _RUN_INFO = run_info
@@ -1077,6 +1220,21 @@ def run_episode(
         "agent_prefix": agent_prefix,
         "video_filename_stem": sanitized_stem,
     }
+    # enrich run_info with recorded room visits and timeline
+    try:
+        enriched_info = dict(run_info or {})
+        enriched_info.setdefault("visited_rooms", list(_ROOM_VISIT_ORDER))
+        enriched_info.setdefault("visited_rooms_set", list(sorted(_ROOM_VISITED_SET)))
+        enriched_info.setdefault("room_timeline", list(_ROOM_TIMELINE))
+        # write back to disk for downstream consumers
+        try:
+            info_path = run_output_root / "run_info.json"
+            info_path.write_text(json.dumps(enriched_info, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        result["run_info"] = enriched_info
+    except Exception:
+        pass
 
     return result
 

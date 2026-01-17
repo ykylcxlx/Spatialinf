@@ -3,6 +3,26 @@
 
 
 # python generate_corr_point_qas.py houses/train_000.json --output-dir ../outputs/corr_point/images --qa-root ../outputs/corr_point --num-samples 20 --visibility-distance 10 --connect-timeout 300 --x-display :99 --qa-json ../outputs/corr_point/all_tasks.json
+# python procthordata/generate_corr_point_qas.py procthordata/houses/train \
+#   --qa-json outputs/corr_point/all_tasks.json \
+#   --resume-from-qa-json \
+#   --output-dir outputs/corr_point/images \
+#   --qa-root outputs/corr_point \
+#   --num-samples 10 \
+#   --x-display :1
+
+
+# python procthordata/generate_corr_point_qas.py procthordata/houses/train \
+#   --qa-json outputs/corr_point/all_tasks.json \
+#   --start-house-index 198 \
+#   --output-dir outputs/corr_point/images \
+#   --qa-root outputs/corr_point \
+#   --num-samples 10 \
+#   --x-display :1
+
+
+
+
 from __future__ import annotations
 
 import argparse
@@ -142,6 +162,21 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help="Number of QA pairs to generate.",
+    )
+    parser.add_argument(
+        "--start-house-index",
+        type=int,
+        default=0,
+        help="Index of the house in the collected house list to start generation from (0-based).",
+    )
+    parser.add_argument(
+        "--resume-from-qa-json",
+        action="store_true",
+        help=(
+            "If set and --qa-json exists, read the existing QA JSON and resume generation "
+            "from the next unprocessed house. This will also preload existing QA entries so new "
+            "samples append instead of overwriting."
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -741,6 +776,7 @@ def generate_samples_for_house(
             qa_entries.append(
                 {
                     "id": f"{id_prefix}_point",
+                    "metadata": {"house": house_path.stem},
                     "images": images_rel,
                     "depths": depths_rel,
                     "messages": [
@@ -766,6 +802,7 @@ def generate_samples_for_house(
             qa_entries.append(
                 {
                     "id": f"{id_prefix}_bbox",
+                    "metadata": {"house": house_path.stem},
                     "images": images_rel,
                     "depths": depths_rel,
                     "messages": [
@@ -794,6 +831,7 @@ def generate_samples_for_house(
             qa_entries.append(
                 {
                     "id": f"{id_prefix}_object",
+                    "metadata": {"house": house_path.stem},
                     "images": images_rel,
                     "depths": depths_rel,
                     "messages": [
@@ -842,7 +880,39 @@ def main() -> None:
     total_samples = 0
     output_json = args.qa_json or (args.output_dir / "qa_pairs.json")
 
-    for house_path in house_paths:
+    # If resuming from an existing QA JSON, preload entries and determine which houses are done
+    start_house_index = max(0, getattr(args, "start_house_index", 0))
+    if args.qa_json and args.qa_json.exists():
+        try:
+            qa_entries = json.loads(args.qa_json.read_text(encoding="utf-8"))
+            existing_tags = {entry["id"].rsplit("_", 1)[0] for entry in qa_entries if "id" in entry}
+            total_samples = len(existing_tags)
+        except Exception:
+            qa_entries = []
+            total_samples = 0
+
+    if args.resume_from_qa_json:
+        if not args.qa_json:
+            raise SystemExit("Error: --resume-from-qa-json requires --qa-json to be specified (path to existing QA JSON).")
+        if not args.qa_json.exists():
+            print(f"Warning: QA JSON {args.qa_json} does not exist; starting from --start-house-index={start_house_index}.")
+        else:
+            processed_houses = {e.get("metadata", {}).get("house") for e in qa_entries if e.get("metadata")}
+            processed_houses = {h for h in processed_houses if h}
+            if processed_houses:
+                # find first house not in processed_houses
+                for idx, p in enumerate(house_paths):
+                    if p.stem not in processed_houses:
+                        start_house_index = idx
+                        break
+                else:
+                    start_house_index = len(house_paths)
+            else:
+                print("Warning: existing QA JSON contains no metadata.house entries; cannot infer processed houses. Use --start-house-index to control where to resume.")
+
+    print(f"Starting generation from house index: {start_house_index} / {len(house_paths)}; total existing samples: {total_samples}")
+
+    for house_path in house_paths[start_house_index:]:
         try:
             house_entries, produced = generate_samples_for_house(
                 house_path, args, sequences, rng, total_samples

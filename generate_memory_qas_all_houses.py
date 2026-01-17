@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -16,7 +17,19 @@ import prior
 
 
 # python generate_memory_qas_all_houses.py   --splits train val   --episodes-per-house 3   --agent-prefix agent_1   --output-root /data5/zhuangyunhao/outputs/memory/per_house   --video-output-root /data5/zhuangyunhao/outputs/memory/per_house/videos   --plan-output-root /data5/zhuangyunhao/outputs/video/per_house   --plan-min-nav-distance 5.0   --generator-args --cooccur-frame-gap 6 --questions-per-size 10
+# python procthordata/generate_memory_qas_all_houses.py --start-index 100 ...
 
+
+# python generate_memory_qas_all_houses.py \
+#   --splits train val \
+#   --start-index 174 \
+#   --episodes-per-house 3 \
+#   --agent-prefix agent_1 \
+#   --output-root /data5/zhuangyunhao/outputs/memory/per_house \
+#   --video-output-root /data5/zhuangyunhao/outputs/memory/per_house/videos \
+#   --plan-output-root /data5/zhuangyunhao/outputs/video/per_house \
+#   --plan-min-nav-distance 5.0 \
+#   --generator-args --cooccur-frame-gap 6 --questions-per-size 10
 DEFAULT_GENERATOR = Path(__file__).resolve().parent / "generate_memory_qas.py"
 DEFAULT_OUTPUT_ROOT = Path("outputs") / "memory" / "per_house"
 DEFAULT_VIDEO_OUTPUT_ROOT = DEFAULT_OUTPUT_ROOT / "videos"
@@ -109,6 +122,14 @@ def parse_args() -> argparse.Namespace:
         "--generator-args",
         nargs=argparse.REMAINDER,
         help="Additional arguments forwarded verbatim to generate_memory_qas.py.",
+    )
+    parser.add_argument(
+        "--resume-from-aggregated",
+        action="store_true",
+        help=(
+            "If set, attempt to read existing per-split aggregated output (memory_conversations.json) "
+            "and resume processing from the first house that has not yet produced entries."
+        ),
     )
     return parser.parse_args()
 
@@ -283,7 +304,49 @@ def main() -> None:
             except Exception as exc:
                 print(f"[WARN] Failed to load existing aggregated data ({exc}); starting fresh.")
 
-        for house_index in iter_scene_indices(scenes, args.start_index, args.end_index, args.max_scenes):
+        # Determine resume start index for this split if requested
+        start_index_for_split = args.start_index
+        if args.resume_from_aggregated:
+            if not aggregated_path.exists():
+                print(f"[WARN] --resume-from-aggregated set but {aggregated_path} does not exist; using --start-index={start_index_for_split}.")
+            else:
+                # collect processed scene ids from existing aggregated entries
+                processed_scene_ids: set[str] = set()
+                for entry in aggregated_data:
+                    metadata = entry.get("metadata") if isinstance(entry, dict) else None
+                    if not isinstance(metadata, dict):
+                        continue
+                    episode_id = metadata.get("episode_id")
+                    if not isinstance(episode_id, str):
+                        continue
+                    # episode_id format: {split}_{scene_id}_ep{idx}
+                    if episode_id.startswith(f"{split}_"):
+                        rem = episode_id[len(split) + 1 :]
+                        pos = rem.rfind("_ep")
+                        if pos != -1:
+                            scene_id = rem[:pos]
+                        else:
+                            scene_id = rem
+                        if scene_id:
+                            processed_scene_ids.add(scene_id)
+
+                if processed_scene_ids:
+                    # find first house index whose scene id is not in processed_scene_ids
+                    found = False
+                    for idx, scene in enumerate(scenes):
+                        scene_id = str(scene.get("id", f"{split}_{idx}"))
+                        if scene_id not in processed_scene_ids:
+                            start_index_for_split = idx
+                            found = True
+                            break
+                    if not found:
+                        start_index_for_split = len(scenes)
+                else:
+                    print(f"[WARN] Aggregated file {aggregated_path} contains no episode metadata for split '{split}'; cannot infer processed houses. Use --start-index to control resume point.")
+
+        print(f"[INFO] split={split} will start at house index {start_index_for_split} / {len(scenes)} (args.start_index={args.start_index})")
+
+        for house_index in iter_scene_indices(scenes, start_index_for_split, args.end_index, args.max_scenes):
             scene = scenes[house_index]
             scene_id = str(scene.get("id", f"{split}_{house_index}"))
             for episode_idx in range(args.episodes_per_house):
@@ -384,6 +447,18 @@ def main() -> None:
                         json.dumps(aggregated_data, ensure_ascii=False, indent=2),
                         encoding="utf-8",
                     )
+
+                    # Save a persistent copy of the per-episode output that the
+                    # generator wrote to the temporary directory. This makes it
+                    # easy to inspect per-house outputs without relying on /tmp.
+                    try:
+                        per_episode_dir = split_output_root / scene_id / f"episode_{episode_idx:02d}"
+                        per_episode_dir.mkdir(parents=True, exist_ok=True)
+                        persistent_path = per_episode_dir / output_name
+                        shutil.copy2(output_file, persistent_path)
+                        print(f"Saved {len(run_entries)} conversation entries to {persistent_path}")
+                    except Exception as exc:
+                        print(f"[WARN] Failed to copy episode output to persistent location: {exc}")
 
                     successes.append((split, f"{scene_id}/episode_{episode_idx:02d}"))
                     if result.stdout:

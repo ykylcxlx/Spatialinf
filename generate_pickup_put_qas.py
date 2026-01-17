@@ -14,59 +14,151 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 Question = Dict[str, Any]
 
+# ...existing code...
 FIRST_ACTION_TEMPLATES: Sequence[str] = (
     "What is the first action the agent executes in this episode?",
     "Which step kicks off the agent's plan?",
     "At the start of the task, what does the agent do?",
+    "Which action does the agent perform first in this run?",
+    "Identify the initial action taken by the agent.",
 )
 
 PICKUP_OBJECT_TEMPLATES: Sequence[str] = (
     "Which object does the agent pick up during this task?",
     "What item is collected when the agent performs the pickup action?",
     "During the pickup step, which object is targeted?",
+    "Which object is grabbed by the agent in the pickup step?",
+    "Name the item the agent picks up as part of the episode.",
 )
 
 PUT_TARGET_TEMPLATES: Sequence[str] = (
     "Where does the agent place the picked-up item?",
     "Which destination object receives the item at the end?",
     "What container does the agent use to finish the task?",
+    "Into which object does the agent put the item?",
+    "Which receptacle is used to place the picked item?",
 )
 
 ACTION_ORDER_TEMPLATES: Sequence[str] = (
     "Arrange these key steps in the correct order of execution: {actions}.",
     "Which option lists the highlighted actions in the order the agent performs them?",
     "From earliest to latest, how do these actions unfold: {actions}?",
+    "Put the following actions in the sequence the agent carries them out: {actions}.",
+    "Select the choice that shows the actions {actions} in execution order.",
 )
 
 NEXT_ACTION_TEMPLATES: Sequence[str] = (
     "After performing '{current}', what does the agent do next?",
     "Which step immediately follows '{current}'?",
     "What action succeeds '{current}' in the sequence?",
+    "Following '{current}', which action comes next?",
+    "What is the subsequent action after '{current}'?",
 )
 
 ACTION_COUNT_TEMPLATES: Sequence[str] = (
     "How many rewarded steps (excluding the final 'end' action) does the agent complete?",
     "Counting every rewarded move except the concluding 'end', how many steps occur?",
     "Excluding the 'end' signal, how many reward-yielding actions are executed?",
+    "How many actionable steps that yield reward are performed before 'end'?",
+    "What is the total number of reward-bearing actions (not counting 'end')?",
 )
 
 TASK_GOAL_TEMPLATES: Sequence[str] = (
     "What is the stated task objective for this episode?",
     "Which instruction best matches the goal the agent is following?",
     "Identify the task description assigned to the agent.",
+    "What goal or instruction is the agent trying to accomplish in this episode?",
+    "Which task summary corresponds to this episode's objective?",
 )
 
 FINAL_STATE_BY_CONTAINER_TEMPLATES: Sequence[str] = (
     "By the end of the episode, which object is placed inside the {container}?",
     "At the conclusion, what item ends up within the {container}?",
     "Looking at the final state, which object rests in the {container}?",
+    "Which object can be found inside the {container} when the episode finishes?",
+    "In the final scene, what is located inside the {container}?",
 )
 
 FINAL_STATE_BY_ITEM_TEMPLATES: Sequence[str] = (
     "When the episode finishes, where is the {item} located?",
     "Which object holds the {item} at the end of the run?",
     "After the final step, the {item} is situated in which object?",
+    "At the end, the {item} ends up in which container or receptacle?",
+    "Which destination contains the {item} when the episode ends?",
 )
+
+FIRST_ACTION_TEMPLATES: Sequence[str] = (
+    "What is the first action the agent executes in this episode?",
+    "Which step kicks off the agent's plan?",
+    "At the start of the task, what does the agent do?",
+    "Which action does the agent perform first in this run?",
+    "Identify the initial action taken by the agent.",
+)
+
+PICKUP_OBJECT_TEMPLATES: Sequence[str] = (
+    "Which object does the agent pick up during this task?",
+    "What item is collected when the agent performs the pickup action?",
+    "During the pickup step, which object is targeted?",
+    "Which object is grabbed by the agent in the pickup step?",
+    "Name the item the agent picks up as part of the episode.",
+)
+
+PUT_TARGET_TEMPLATES: Sequence[str] = (
+    "Where does the agent place the picked-up item?",
+    "Which destination object receives the item at the end?",
+    "What container does the agent use to finish the task?",
+    "Into which object does the agent put the item?",
+    "Which receptacle is used to place the picked item?",
+)
+
+ACTION_ORDER_TEMPLATES: Sequence[str] = (
+    "Arrange these key steps in the correct order of execution: {actions}.",
+    "Which option lists the highlighted actions in the order the agent performs them?",
+    "From earliest to latest, how do these actions unfold: {actions}?",
+    "Put the following actions in the sequence the agent carries them out: {actions}.",
+    "Select the choice that shows the actions {actions} in execution order.",
+)
+
+NEXT_ACTION_TEMPLATES: Sequence[str] = (
+    "After performing '{current}', what does the agent do next?",
+    "Which step immediately follows '{current}'?",
+    "What action succeeds '{current}' in the sequence?",
+    "Following '{current}', which action comes next?",
+    "What is the subsequent action after '{current}'?",
+)
+
+ACTION_COUNT_TEMPLATES: Sequence[str] = (
+    "How many rewarded steps (excluding the final 'end' action) does the agent complete?",
+    "Counting every rewarded move except the concluding 'end', how many steps occur?",
+    "Excluding the 'end' signal, how many reward-yielding actions are executed?",
+    "How many actionable steps that yield reward are performed before 'end'?",
+    "What is the total number of reward-bearing actions (not counting 'end')?",
+)
+
+TASK_GOAL_TEMPLATES: Sequence[str] = (
+    "What is the stated task objective for this episode?",
+    "Which instruction best matches the goal the agent is following?",
+    "Identify the task description assigned to the agent.",
+    "What goal or instruction is the agent trying to accomplish in this episode?",
+    "Which task summary corresponds to this episode's objective?",
+)
+
+FINAL_STATE_BY_CONTAINER_TEMPLATES: Sequence[str] = (
+    "By the end of the episode, which object is placed inside the {container}?",
+    "At the conclusion, what item ends up within the {container}?",
+    "Looking at the final state, which object rests in the {container}?",
+    "Which object can be found inside the {container} when the episode finishes?",
+    "In the final scene, what is located inside the {container}?",
+)
+
+FINAL_STATE_BY_ITEM_TEMPLATES: Sequence[str] = (
+    "When the episode finishes, where is the {item} located?",
+    "Which object holds the {item} at the end of the run?",
+    "After the final step, the {item} is situated in which object?",
+    "At the end, the {item} ends up in which container or receptacle?",
+    "Which destination contains the {item} when the episode ends?",
+)
+# ...existing code...
 
 MAX_CHOICES = 4
 

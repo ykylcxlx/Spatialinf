@@ -17,15 +17,23 @@ import numpy as np
 
 from ai2thor.controller import Controller
 
-# python procthordata/generate_camera_qas.py \
-#   procthordata/houses/train \
+
+# 指定从某个房间开始
+# python procthordata/generate_camera_qas.py procthordata/houses/train --start-house-index 100 ...
+
+# python procthordata/generate_camera_qas.py procthordata/houses/train --qa-json outputs/cam_motion/cam_motion.json --resume-from-qa-json ...
+
+# python procthordata/generate_camera_qas.py procthordata/houses/train \
+#   --qa-json outputs/cam_motion/cam_motion.json \
+#   --resume-from-qa-json \
 #   --output-dir outputs/cam_motion/images \
 #   --qa-root outputs/cam_motion \
 #   --num-samples 3 \
 #   --visibility-distance 10 \
 #   --connect-timeout 300 \
-#   --x-display :99 \
-#   --qa-json outputs/cam_motion/all_tasks.json
+#   --x-display :99
+
+
 
 # Action pools for random sequence generation (all rotations < 90°).
 TRANSLATION_ACTIONS: Tuple[str, ...] = ("MoveAhead", "MoveBack", "MoveLeft", "MoveRight")
@@ -202,19 +210,39 @@ def build_direction_options(correct_label: str, rng: random.Random) -> Tuple[Lis
 
 
 def build_distance_options(correct_mm: int, rng: random.Random) -> Tuple[List[Tuple[str, str]], str]:
-    offsets = [-250, -180, -120, -60, 60, 120, 180, 250, 320, 420]
+    base = max(1, int(round(correct_mm)))
     candidates: List[int] = []
-    for offset in offsets:
-        candidate = max(1, correct_mm + offset)
-        if candidate != correct_mm:
+
+    # Prefer proportional distractors (fractions/multiples of the correct value)
+    proportional_factors = (0.4, 0.6, 0.8, 1.2, 1.5, 2.0)
+    for f in proportional_factors:
+        candidate = int(round(base * f))
+        if candidate != base and candidate >= 10:
             candidates.append(candidate)
-    while len(candidates) < len(CHOICE_LETTERS) - 1:
+
+    # Also add reasonable absolute offsets (millimetres), ensuring non-trivial values
+    absolute_offsets = (30, 60, 90, 120, 180)
+    for off in absolute_offsets:
+        plus = base + off
+        minus = base - off
+        if plus != base:
+            candidates.append(plus)
+        if minus >= 10 and minus != base:
+            candidates.append(minus)
+
+    # Fill any remaining slots with scaled variations, avoiding extreme tiny values like 1 mm
+    attempts = 0
+    while len(candidates) < len(CHOICE_LETTERS) - 1 and attempts < 32:
+        attempts += 1
         scale = rng.uniform(0.6, 1.6)
-        candidate = max(1, int(round(correct_mm * scale)))
-        if candidate != correct_mm:
+        candidate = int(round(base * scale))
+        if candidate != base and candidate >= 10 and candidate not in candidates:
             candidates.append(candidate)
-    distractors = [format_distance_mm(value) for value in candidates]
-    return build_choice_options(format_distance_mm(correct_mm), distractors, rng)
+
+    # Truncate and format
+    candidates = list(dict.fromkeys(candidates))  # preserve order, remove duplicates
+    distractors = [format_distance_mm(value) for value in candidates[: len(CHOICE_LETTERS) - 1]]
+    return build_choice_options(format_distance_mm(base), distractors, rng)
 
 
 def build_rotation_options(correct_label: str, rng: random.Random) -> Tuple[List[Tuple[str, str]], str]:
@@ -284,6 +312,21 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help="Number of QA sample sets to generate per house.",
+    )
+    parser.add_argument(
+        "--start-house-index",
+        type=int,
+        default=0,
+        help="Index of the house in the collected house list to start generation from (0-based).",
+    )
+    parser.add_argument(
+        "--resume-from-qa-json",
+        action="store_true",
+        help=(
+            "If set and --qa-json exists, read the existing QA JSON and resume generation "
+            "from the next unprocessed house. This will also preload existing QA entries so new "
+            "samples append instead of overwriting."
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -577,19 +620,51 @@ def main() -> None:
     if args.qa_json is not None:
         args.qa_json.parent.mkdir(parents=True, exist_ok=True)
 
+    # Validate resume usage early to avoid silent falls back to start
+    if args.resume_from_qa_json and not args.qa_json:
+        raise SystemExit("Error: --resume-from-qa-json requires --qa-json to be specified (path to existing QA JSON).")
+
     random.seed(args.seed)
     rng = random.Random(args.seed)
 
     sequences = load_sequences(args.sequences)
     house_paths = collect_house_paths(args.house_json)
 
+    # Prepare output JSON path
+    output_json = args.qa_json or (args.qa_root / "qa_pairs.json")
+
+    # Optionally preload existing QA entries so we can resume and keep consistent sample ids
     qa_entries: List[dict] = []
     category_totals: Dict[str, List[dict]] = {key: [] for key in CATEGORY_TEMPLATES}
     total_samples = 0
 
-    output_json = args.qa_json or (args.qa_root / "qa_pairs.json")
+    # If an existing QA JSON is present, load it so we can append rather than overwrite.
+    if args.qa_json and args.qa_json.exists():
+        try:
+            qa_entries = json.loads(args.qa_json.read_text(encoding="utf-8"))
+            existing_tags = {entry["id"].rsplit("_", 1)[0] for entry in qa_entries if "id" in entry}
+            total_samples = len(existing_tags)
+        except Exception:
+            qa_entries = []
+            total_samples = 0
 
-    for house_path in house_paths:
+    # Determine which house index to start from.
+    start_house_index = max(0, args.start_house_index)
+    if args.resume_from_qa_json and args.qa_json and args.qa_json.exists():
+        processed_houses = {
+            e.get("metadata", {}).get("house") for e in qa_entries if e.get("metadata")
+        }
+        # Find first house in the collected list that is not in processed_houses
+        start_house_index = 0
+        for idx, p in enumerate(house_paths):
+            if p.stem not in processed_houses:
+                start_house_index = idx
+                break
+        else:
+            start_house_index = len(house_paths)
+
+    # Iterate over the selected slice of houses
+    for house_path in house_paths[start_house_index:]:
         try:
             house_entries, produced, category_entries = generate_samples_for_house(
                 house_path, args, sequences, rng, total_samples
@@ -721,7 +796,12 @@ def summarize_action_rotations(actions: Sequence[ActionSpec]) -> Dict[str, float
             pitch_total -= float(params.get("degrees", 30.0))
         elif action == "LookDown":
             pitch_total += float(params.get("degrees", 30.0))
-    return {"action_yaw_deg": yaw_total, "action_pitch_deg": pitch_total}
+    # The controller's observed delta yaw (final - initial) may have the
+    # opposite sign convention from the incremental action accumulation
+    # used above. In order to make the reported `action_yaw_deg` align with
+    # `compute_motion_metrics`'s `delta_yaw_deg` sign (so metadata fields are
+    # consistent), negate the accumulated yaw total here.
+    return {"action_yaw_deg": -yaw_total, "action_pitch_deg": pitch_total}
 
 
 def rotation_direction(

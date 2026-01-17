@@ -39,6 +39,32 @@ CO_OCCURRENCE_TEMPLATES: Sequence[str] = (
     "Which option lists only the objects present in both frame {frame_a} and frame {frame_b}?",
 )
 
+# Room-related templates
+ROOM_COUNT_TEMPLATES: Sequence[str] = (
+    "How many rooms are in the house shown in the clip?",
+    "What is the total number of rooms visible in the episode?",
+    "Counting distinct rooms, how many does the house have in this recording?",
+)
+
+ROOM_AREA_TEMPLATES: Sequence[str] = (
+    "What is the approximate floor area of the {room_name} (in square units)?",
+    "Estimate the area of the {room_name} shown in the clip (rounded).",
+    "What is the area of the {room_name}?",
+)
+
+VISITED_ROOMS_TEMPLATES: Sequence[str] = (
+    "Which rooms did the robot pass through during the clip?",
+    "Select the rooms that the agent visited while recording the episode.",
+    "During the footage, the robot travelled through which rooms?",
+)
+
+# Template asking for the room type of the k-th visited room
+ROOM_INDEX_TYPE_TEMPLATES: Sequence[str] = (
+    "Which room type is the {ordinal} room the robot passed through?",
+    "The robot's {ordinal} visited room corresponds to which room type?",
+)
+
+
 EARLIEST_OBJECT_TEMPLATES: Sequence[str] = (
     "Which object among {objects} shows up first in the video?",
     "Thinking back, which of {objects} is seen earliest?",
@@ -586,6 +612,266 @@ def generate_first_frame_questions(
     return questions
 
 
+def _load_run_info(episode_dir: Path) -> Dict[str, Any]:
+    run_info_path = episode_dir / "run_info.json"
+    if run_info_path.exists():
+        try:
+            return json.loads(run_info_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _get_visited_sequence(run_info: Dict[str, Any], episode_dir: Path) -> List[str]:
+    """Return the visited room sequence (ordered, deduplicated across consecutive repeats).
+    Prefer `run_info["visited_rooms"]` then `run_info["room_timeline"]`, else scan frame JSONs.
+    """
+    # prefer explicit ordered list
+    visited = run_info.get("visited_rooms")
+    if isinstance(visited, list) and visited:
+        # ensure we remove consecutive duplicates but keep order
+        seq: List[str] = []
+        for rid in visited:
+            if not seq or seq[-1] != rid:
+                seq.append(rid)
+        return seq
+
+    # try timeline entries
+    timeline = run_info.get("room_timeline") or run_info.get("roomTimeline")
+    if isinstance(timeline, list) and timeline:
+        seq = []
+        for entry in timeline:
+            rid = entry.get("room_id") or entry.get("roomId")
+            if rid and (not seq or seq[-1] != rid):
+                seq.append(rid)
+        if seq:
+            return seq
+
+    # fallback: scan frame jsons under agent_* folders
+    agent_dirs = sorted(episode_dir.glob("agent_*"))
+    seq: List[str] = []
+    for agent_dir in agent_dirs:
+        for path in sorted(agent_dir.glob("img_*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            # prefer explicit field if present
+            rid = data.get("room_id")
+            if not rid:
+                # parse raw itemlist entries for room markers
+                for raw in data.get("itemlist", []):
+                    if not raw:
+                        continue
+                    parts = raw.split("|")
+                    name = parts[0].strip().lower()
+                    if name == "room":
+                        # reconstruct id like "room|6" if available
+                        if len(parts) >= 2 and parts[1].strip():
+                            rid = f"room|{parts[1].strip()}"
+                            break
+            if rid and (not seq or seq[-1] != rid):
+                seq.append(rid)
+    return seq
+
+
+def generate_room_count_question(run_info: Dict[str, Any], rng: random.Random, episode_dir: Path) -> Optional[QuestionEntry]:
+    visited_seq = _get_visited_sequence(run_info, episode_dir)
+    if visited_seq:
+        total = len(set(visited_seq))
+    else:
+        # fallback to run_info total_rooms if available
+        total = int(run_info.get("total_rooms")) if run_info.get("total_rooms") is not None else None
+        if total is None:
+            return None
+
+    # create reasonable distractors around the observed distinct count
+    candidates = [total, max(1, total - 1), total + 1, max(1, total - 2)]
+    options = sorted(set(candidates))
+    rng.shuffle(options)
+    option_strings = [str(v) for v in options]
+    answer = str(total)
+    try:
+        answer_index = option_strings.index(answer)
+    except ValueError:
+        option_strings[0] = answer
+        answer_index = 0
+    template = rng.choice(ROOM_COUNT_TEMPLATES)
+    qtext = template
+    metadata = {"question_type": "room_count", "visited_distinct_rooms": total}
+    if visited_seq:
+        metadata["visited_sequence"] = visited_seq
+    metadata = attach_episode_metadata(metadata, episode_dir)
+    return {"question": qtext, "choices": option_strings, "answer_index": answer_index, "answer": answer, "metadata": metadata}
+
+
+def generate_room_area_questions(run_info: Dict[str, Any], rng: random.Random, limit: int, episode_dir: Path) -> List[QuestionEntry]:
+    # Prefer rooms from the visited sequence so we can reference "the k-th room the robot passed through".
+    visited_seq = _get_visited_sequence(run_info, episode_dir)
+    rooms_map = {r.get("id"): r for r in (run_info.get("rooms") or [])}
+    questions: List[QuestionEntry] = []
+    # If visited sequence exists, ask about those indices; otherwise sample rooms from run_info.rooms
+    if visited_seq:
+        indices = list(range(len(visited_seq)))
+    else:
+        indices = list(range(len(list(rooms_map.keys()))))
+    rng.shuffle(indices)
+    for idx in indices:
+        if len(questions) >= limit:
+            break
+        if visited_seq:
+            rid = visited_seq[idx]
+            room = rooms_map.get(rid)
+        else:
+            # pick from rooms_map by index order
+            keys = list(rooms_map.keys())
+            if not keys:
+                continue
+            rid = keys[idx % len(keys)]
+            room = rooms_map.get(rid)
+        if not room:
+            continue
+        area = room.get("area")
+        if area is None:
+            continue
+        correct = round(float(area), 2)
+        # distractors: use areas of other rooms if available, else perturb
+        other_areas = [round(float(r.get("area", 0.0)), 2) for r in rooms_map.values() if r.get("id") != rid and r.get("area")]
+        options_vals = [correct]
+        rng.shuffle(other_areas)
+        for val in other_areas[:3]:
+            options_vals.append(val)
+        # if not enough, add small perturbations
+        offset = 1.0
+        while len(options_vals) < 2 and offset < correct * 2 + 2:
+            cand = round(max(0.0, correct + (offset if rng.random() < 0.5 else -offset)), 2)
+            if cand not in options_vals:
+                options_vals.append(cand)
+            offset += 1.0
+        options = sorted(set(options_vals))
+        rng.shuffle(options)
+        option_strings = [str(v) for v in options[:4]]
+        answer = str(correct)
+        try:
+            answer_index = option_strings.index(answer)
+        except ValueError:
+            option_strings[0] = answer
+            answer_index = 0
+        # phrase the question: reference visited order when available, otherwise use roomType/name
+        if visited_seq:
+            ordinal = idx + 1
+            template = rng.choice(ROOM_AREA_TEMPLATES)
+            qtext = template.format(room_name=f"the {ordinal}th room the robot passed through")
+            meta = {"question_type": "room_area", "room_id": rid, "area": correct, "visited_index": ordinal}
+        else:
+            # use human-friendly roomType if available
+            rname = room.get("roomType") or rid
+            template = rng.choice(ROOM_AREA_TEMPLATES)
+            qtext = template.format(room_name=rname)
+            meta = {"question_type": "room_area", "room_id": rid, "area": correct, "room_name": rname}
+        metadata = attach_episode_metadata(meta, episode_dir)
+        questions.append({"question": qtext, "choices": option_strings, "answer_index": answer_index, "answer": answer, "metadata": metadata})
+    return questions
+
+
+def generate_visited_rooms_questions(run_info: Dict[str, Any], episode_dir: Path, rng: random.Random, limit: int) -> List[QuestionEntry]:
+    # prefer run_info visited list, else parse frames
+    visited = run_info.get("visited_rooms") or run_info.get("visited_rooms_set")
+    if not visited:
+        # fallback: scan agent frame jsons
+        agent_dirs = list(episode_dir.glob("agent_*"))
+        visited_set = []
+        for agent_dir in agent_dirs:
+            for path in sorted(agent_dir.glob("img_*.json")):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                rid = data.get("room_id")
+                if rid and (not visited_set or visited_set[-1] != rid):
+                    if rid not in visited_set:
+                        visited_set.append(rid)
+        visited = visited_set
+    if not visited:
+        return []
+    all_rooms = [r.get("id") for r in (run_info.get("rooms") or []) if r.get("id")]
+    if not all_rooms:
+        return []
+    questions: List[QuestionEntry] = []
+    # ask one question with the full visited set (deduplicated)
+    correct_set = sorted(set(visited))
+    # build distractor sets by sampling other rooms
+    union_pool = sorted(set(all_rooms))
+    # create options: correct and up to 3 distractors
+    options = [", ".join(correct_set)]
+    attempts = 0
+    while len(options) < 4 and attempts < 50:
+        candidate = sorted(rng.sample(union_pool, max(1, len(correct_set))))
+        candidate_str = ", ".join(candidate)
+        if candidate_str not in options:
+            options.append(candidate_str)
+        attempts += 1
+    rng.shuffle(options)
+    answer = ", ".join(correct_set)
+    try:
+        answer_index = options.index(answer)
+    except ValueError:
+        options[0] = answer
+        answer_index = 0
+    template = rng.choice(VISITED_ROOMS_TEMPLATES)
+    qtext = template
+    metadata = attach_episode_metadata({"question_type": "visited_rooms", "visited_rooms": correct_set}, episode_dir)
+    questions.append({"question": qtext, "choices": options, "answer_index": answer_index, "answer": answer, "metadata": metadata})
+    return questions
+
+
+def generate_room_index_type_questions(run_info: Dict[str, Any], rng: random.Random, limit: int, episode_dir: Path) -> List[QuestionEntry]:
+    """Generate questions of the form: 'the k-th room the robot passed through is which room type?'
+    Answer is the `roomType` string for that visited room.
+    """
+    visited_seq = _get_visited_sequence(run_info, episode_dir)
+    if not visited_seq:
+        return []
+    rooms_info = {r.get("id"): r for r in (run_info.get("rooms") or [])}
+    # collect available room types to use as distractors
+    all_types = sorted({(r.get("roomType") or r.get("id")) for r in (run_info.get("rooms") or []) if r})
+    if not all_types:
+        return []
+    questions: List[QuestionEntry] = []
+    indices = list(range(len(visited_seq)))
+    rng.shuffle(indices)
+    for idx in indices:
+        if len(questions) >= limit:
+            break
+        rid = visited_seq[idx]
+        room = rooms_info.get(rid)
+        room_type = None
+        if room:
+            room_type = room.get("roomType")
+        if not room_type:
+            # fallback: use the id as a label
+            room_type = rid
+        # build options: correct + sampled distractor types
+        options = [room_type]
+        pool = [t for t in all_types if t != room_type]
+        rng.shuffle(pool)
+        for t in pool[:3]:
+            options.append(t)
+        rng.shuffle(options)
+        answer = room_type
+        try:
+            answer_index = options.index(answer)
+        except ValueError:
+            options[0] = answer
+            answer_index = 0
+        ordinal = idx + 1
+        template = rng.choice(ROOM_INDEX_TYPE_TEMPLATES)
+        qtext = template.format(ordinal=f"{ordinal}th")
+        metadata = attach_episode_metadata({"question_type": "room_index_type", "room_id": rid, "visited_index": ordinal, "room_type": room_type}, episode_dir)
+        questions.append({"question": qtext, "choices": options, "answer_index": answer_index, "answer": answer, "metadata": metadata})
+    return questions
+
+
 def collect_video_paths(video_map: Dict[str, str]) -> List[Path]:
     ordered_keys = ["agent", "top_view"]
     paths: List[Path] = []
@@ -661,10 +947,19 @@ def build_conversation_entry(
         ],
         "videos": list(video_refs),
     }
-
+    # Reduce metadata to only essential fields per user's request.
     metadata = question.get("metadata")
-    if isinstance(metadata, dict) and metadata:
-        entry["metadata"] = dict(metadata)
+    reduced: Dict[str, Any] = {}
+    if isinstance(metadata, dict):
+        qtype = metadata.get("question_type")
+        if qtype:
+            reduced["question_type"] = qtype
+        # include likely 'target' fields when present
+        for key in ("object", "room_id", "room_type", "visited_index", "visited_rooms", "room_name", "visited_distinct_rooms"):
+            if key in metadata:
+                reduced[key] = metadata.get(key)
+    if reduced:
+        entry["metadata"] = reduced
     if conversation_id:
         entry["id"] = conversation_id
 
@@ -779,6 +1074,25 @@ def main() -> None:
         first_frame = generate_first_frame_questions(first_seen, rng, args.first_frame_questions, episode_dir)
         if first_frame:
             all_questions.extend(first_frame)
+
+    # Room-related questions: use run_info if available
+    run_info = _load_run_info(episode_dir)
+    # total room count (one question)
+    room_count_q = generate_room_count_question(run_info, rng, episode_dir)
+    if room_count_q:
+        all_questions.append(room_count_q)
+    # room area questions (sample up to 3)
+    area_qs = generate_room_area_questions(run_info, rng, limit=3, episode_dir=episode_dir)
+    if area_qs:
+        all_questions.extend(area_qs)
+    # visited rooms question(s)
+    visited_qs = generate_visited_rooms_questions(run_info, episode_dir, rng, limit=1)
+    if visited_qs:
+        all_questions.extend(visited_qs)
+    # room type by visited index questions
+    index_type_qs = generate_room_index_type_questions(run_info, rng, limit=1, episode_dir=episode_dir)
+    if index_type_qs:
+        all_questions.extend(index_type_qs)
 
     if not all_questions:
         raise RuntimeError("No questions could be generated with the current configuration.")
